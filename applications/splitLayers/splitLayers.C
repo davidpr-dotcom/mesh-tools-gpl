@@ -36,6 +36,7 @@
 #include "EdgeMap.H"
 #include "edgeList.H"
 #include "unitConversion.H"
+#include "OFstream.H"
 
 #include <algorithm>
 #include <fstream>
@@ -171,6 +172,12 @@ struct Column
 
 struct RailData
 {
+    labelList joints;           // FULL point path — the rail's identity.
+                                // Keying by first edge alone is ambiguous:
+                                // at corner bisectors two columns share
+                                // their first rail edge and then DIVERGE
+                                // (2026-06-12 forensics: strips built with
+                                // rings of the other path's rings).
     labelList rings;            // n new point labels, wall-side first
     labelList assign;           // n: segment index of each ring
     label nSeg = 0;
@@ -189,6 +196,8 @@ int main(int argc, char *argv[])
     argList::addOption("featureAngle", "deg",
                        "feature-point detection angle (default 45)");
     argList::addBoolOption("dryRun", "identify and report columns only");
+    argList::addBoolOption("debugDump",
+        "write constant/splitLayersDebugMap: finalFace origFace tag column");
     #include "setRootCase.H"
     #include "createTime.H"
 
@@ -214,6 +223,27 @@ int main(int argc, char *argv[])
     const label nOptSweeps = args.getOrDefault<label>("optimizeSweeps", 10);
     const scalar featAngle = args.getOrDefault<scalar>("featureAngle", 45.0);
     const bool dryRun = args.found("dryRun");
+    const bool debugDump = args.found("debugDump");
+
+    // forensics: original-face -> (construct tag, column id)
+    Map<word> faceTagOf;
+    Map<label> faceColOf;
+    auto recordFace = [&](const label origFace, const char* tag,
+                          const label ci2)
+    {
+        if (!debugDump) { return; }
+        if (faceTagOf.found(origFace))
+        {
+            // multiple constructs touching one original face is itself
+            // suspicious — keep both tags
+            faceTagOf[origFace] = faceTagOf[origFace] + "+" + tag;
+        }
+        else
+        {
+            faceTagOf.insert(origFace, word(tag));
+            faceColOf.insert(origFace, ci2);
+        }
+    };
 
     const polyBoundaryMesh& patches = mesh.boundaryMesh();
     const faceList& faces = mesh.faces();
@@ -427,14 +457,22 @@ int main(int argc, char *argv[])
         if (col.skip) { continue; }
         const label m = col.chain.size();
 
-        // (a) shared-rail consistency
+        // (a) shared-rail consistency: chain length, scale AND the ring->
+        // segment assignment table must match what a neighbouring column
+        // already recorded on a shared rail. Assignment mismatch was the
+        // bracket quality defect (2026-06-12 forensics: all 89 bad faces
+        // were strips of columns whose shared rails were subdivided under
+        // a neighbour's table while their own rails used their own).
+        const labelList a0 = computeAssign(col, 0);
         bool conflict = false;
         forAll(col.rails, c)
         {
             const auto it = railsOf.cfind(railKey(col, c));
             if (it.good()
              && (it.val().nSeg != m
-              || mag(it.val().scale - col.scale) > 1e-6 * col.scale + VSMALL))
+              || mag(it.val().scale - col.scale) > 1e-6 * col.scale + VSMALL
+              || it.val().assign != a0
+              || it.val().joints != col.rails[c]))   // FULL-PATH identity
             {
                 conflict = true;
             }
@@ -446,8 +484,32 @@ int main(int argc, char *argv[])
             continue;
         }
 
+        // (a2) degenerate chains: ANY duplicate point among the four rails
+        // (converging rails in trimmed cells) breaks rail-pair
+        // identification and point substitution — strips then borrow ring
+        // points from a rail that is not on the face (2026-06-12
+        // forensics: bowtie/teleported-vertex strips at mid-chain
+        // segments). Skip strictly.
+        {
+            labelHashSet railPts(4 * (m + 1));
+            bool degen = false;
+            forAll(col.rails, c)
+            {
+                for (const label p : col.rails[c])
+                {
+                    if (!railPts.insert(p)) { degen = true; break; }
+                }
+                if (degen) { break; }
+            }
+            if (degen)
+            {
+                col.skip = true; col.reason = "warp";
+                ++nWarp[col.si];
+                continue;
+            }
+        }
+
         // (b) warp: all four rails must agree on ring->segment assignment
-        const labelList a0 = computeAssign(col, 0);
         bool warp = false;
         for (label c = 1; c < 4 && !warp; ++c)
         {
@@ -575,6 +637,7 @@ int main(int argc, char *argv[])
             if (!railsOf.found(railKey(col, c)))
             {
                 RailData rd;
+                rd.joints = col.rails[c];
                 rd.nSeg = m;
                 rd.scale = col.scale;
                 rd.si = col.si;
@@ -874,6 +937,7 @@ int main(int argc, char *argv[])
             meshMod.modifyFace(faces[col.meshFacei], col.meshFacei,
                                stack[0], -1, false, patchi, -1, false);
             faceDone.set(col.meshFacei);
+            recordFace(col.meshFacei, "wall+rings", ci);
         }
 
         // 2. ring faces (reversed wall-face order -> normal away from wall)
@@ -897,6 +961,7 @@ int main(int argc, char *argv[])
             {
                 meshMod.removeFace(fi, -1);
                 faceDone.set(fi);
+                recordFace(fi, "ifaceRemoved", ci);
             }
         }
 
@@ -935,6 +1000,7 @@ int main(int argc, char *argv[])
                                    -1, false);
             }
             faceDone.set(col.topFace);
+            recordFace(col.topFace, "top", ci);
         }
 
         // 5. side faces, per chain cell, partitioned by assigned rings
@@ -1067,6 +1133,26 @@ int main(int argc, char *argv[])
                     }
                 }
                 faceDone.set(fi);
+                if (debugDump)
+                {
+                    const label ownO2 = mesh.faceOwner()[fi];
+                    const label nei2 = mesh.isInternalFace(fi)
+                                     ? mesh.faceNeighbour()[fi] : -1;
+                    const label oth = (ownO2 == col.chain[i]) ? nei2 : ownO2;
+                    std::string t = "strips:seg" + std::to_string(i)
+                        + ":cuts" + std::to_string(cutK.size());
+                    if (oth < 0) { t += ":bnd"; }
+                    else if (claimed[oth] >= 0)
+                    {
+                        const label oc = claimed[oth];
+                        t += ":oc" + std::to_string(oc)
+                           + (columns[oc].skip ? "SKIP" : "")
+                           + ":oseg"
+                           + std::to_string(columns[oc].chain.find(oth));
+                    }
+                    else { t += ":plain"; }
+                    recordFace(fi, t.c_str(), ci);
+                }
             }
         }
     }
@@ -1122,11 +1208,43 @@ int main(int argc, char *argv[])
             -1, false
         );
         faceDone.set(fi);
+        recordFace(fi, "lateral", -1);
     }
 
     // ---- apply ------------------------------------------------------------
     autoPtr<mapPolyMesh> map = meshMod.changeMesh(mesh, false);
     mesh.updateMesh(map());
+
+    if (debugDump)
+    {
+        OFstream os(runTime.constantPath()/"splitLayersDebugMap");
+        os  << "# finalFace origFace tag column" << nl;
+        const labelList& fMap = map().faceMap();   // final -> origin/master
+        forAll(fMap, ff)
+        {
+            const label of = fMap[ff];
+            if (of >= 0 && faceTagOf.found(of))
+            {
+                os  << ff << ' ' << of << ' ' << faceTagOf[of] << ' '
+                    << faceColOf[of] << nl;
+            }
+        }
+        OFstream osc(runTime.constantPath()/"splitLayersDebugCols");
+        osc << "# ci skip chain | rail0 | rail1 | rail2 | rail3" << nl;
+        forAll(columns, ci)
+        {
+            const Column& c2 = columns[ci];
+            osc << ci << ' ' << (c2.skip ? 1 : 0) << ' ';
+            for (const label cc : c2.chain) { osc << cc << ' '; }
+            forAll(c2.rails, r2)
+            {
+                osc << "| ";
+                for (const label p2 : c2.rails[r2]) { osc << p2 << ' '; }
+            }
+            osc << nl;
+        }
+        Info<< "SPLITLAYERS|debugDump|written" << nl;
+    }
 
     Info<< "SPLITLAYERS|topology|cells|" << mesh.nCells()
         << "|points|" << mesh.nPoints() << nl;
