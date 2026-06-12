@@ -1,30 +1,26 @@
 /*---------------------------------------------------------------------------*\
     splitLayers — split-based boundary-layer generation (WP 5.4-spike)
 
-    Carves graded boundary layers out of existing wall-adjacent hex cells by
-    inserting points along the wall-normal cell columns and rebuilding the
-    topology. No mesh movement of pre-existing points, no extrusion, no
-    coverage failure mode: every wall face of the target patch that heads a
-    hex column receives exactly the specified layers (columns that cannot be
-    split are skipped and REPORTED — the skip rate is a primary spike metric).
+    Multi-row columns (see docs/multi-row-columns.md): a column is a CHAIN
+    of hex cells walked from the wall face through successive opposing
+    faces, so the layer stack is no longer bounded by the (possibly
+    trimmed) wall-cell height. Ring points are placed along the chain's
+    four corner RAILS at arc-length positions; the chain's interface faces
+    are absorbed; side faces are partitioned by the rings assigned to
+    their segment; rail joints survive as polygon vertices for lateral
+    neighbours.
 
-    Pipeline:
-      1. spec        layer-spec JSON (etc/contracts/layer-spec, semver 0.x)
-      2. columns     wall face -> opposing face of the owner hex; the four
-                     point-to-point cell edges form the column
-      3. placement   ring points at absolute heights y1*er^k along either
-                     the column edge (-placement edge) or the smoothed
-                     inward point-normal field (-placement normal, default;
-                     falls back to the edge direction beyond 60 degrees)
-      4. topology    polyTopoChange: n layer cells + remainder per column;
-                     side faces of split cells become strip stacks; lateral
-                     faces of non-split neighbours keep one face with the
-                     ring points inserted into their polygon (no hanging
-                     points)
-      5. optimize    -optimizeSweeps N (default 10, 0 = off): tangential
-                     Laplacian smoothing of ring points with the radial
-                     height constraint re-imposed each sweep (wall points
-                     fixed by construction)
+    Consistency (v1, strictness over cleverness): rings are a property of
+    the rail (first column wins); columns whose shared rails disagree on
+    scale/segmentation, whose own rails disagree on ring->segment
+    assignment, or whose side faces are claimed by a crossing chain are
+    SKIPPED and reported. All conflicts are detected before any point is
+    created.
+
+    Stages: spec (layer-spec JSON 0.x) -> identification -> conflict
+    pre-passes -> ring creation -> topology (polyTopoChange) -> optional
+    offset-vector smoothing (-optimizeSweeps, wall points fixed).
+    `-placement normal` applies to single-cell columns only.
 
     Diagnostics on stdout with the `SPLITLAYERS|` prefix.
     License: GPL-3.0-or-later (links OpenFOAM libraries).
@@ -37,10 +33,8 @@
 #include "mapPolyMesh.H"
 #include "polyPatch.H"
 #include "emptyPolyPatch.H"
-#include "processorPolyPatch.H"
 #include "EdgeMap.H"
 #include "edgeList.H"
-#include "IFstream.H"
 #include "unitConversion.H"
 
 #include <algorithm>
@@ -100,10 +94,6 @@ static List<PatchSpec> readSpec(const fileName& specFile)
 
 // * * * * * * * * * *  smoothed inward point normals  * * * * * * * * * * //
 
-// Area-weighted inward point normals on the patch, Laplacian-smoothed over
-// patch points. Feature points (adjacent patch-face normals differing by
-// more than featureAngle) take part like any other point — smoothing is
-// what produces the bisector-like directions there.
 static vectorField smoothedInwardNormals
 (
     const polyPatch& pp,
@@ -125,7 +115,6 @@ static vectorField smoothedInwardNormals
     }
     n /= max(mag(n), SMALL);
 
-    // feature-point count (diagnostic): max angle between adjacent faces
     const scalar cosFeat = Foam::cos(degToRad(featureAngleDeg));
     nFeaturePoints = 0;
     forAll(pointFaces, pi)
@@ -142,7 +131,6 @@ static vectorField smoothedInwardNormals
         if (feat) { ++nFeaturePoints; }
     }
 
-    // Laplacian smoothing over patch point-point connectivity
     const edgeList& edges = pp.edges();
     for (label it = 0; it < nSmooth; ++it)
     {
@@ -165,24 +153,37 @@ static vectorField smoothedInwardNormals
     return n;
 }
 
-// * * * * * * * * * * * * * column structure  * * * * * * * * * * * * * * //
+// * * * * * * * * * * * * * column structures * * * * * * * * * * * * * * //
 
 struct Column
 {
-    label patchFacei;       // local patch face index
-    label meshFacei;        // global wall face
-    label celli;            // owner hex
-    label oppFacei;         // opposing face
-    FixedList<label, 4> base;   // wall-face points (mesh labels)
-    FixedList<label, 4> top;    // matching opposing points (mesh labels)
+    label patchFacei = -1;
+    label meshFacei = -1;       // wall face
+    label si = -1;              // spec index
+    labelList chain;            // cells, wall first
+    labelList ifaces;           // interfaces between chain cells (m-1)
+    label topFace = -1;         // opposing face of the last cell
+    FixedList<labelList, 4> rails;   // point paths, size m+1 each
+    scalar scale = 1.0;
+    bool skip = false;
+    const char* reason = nullptr;
+};
+
+struct RailData
+{
+    labelList rings;            // n new point labels, wall-side first
+    labelList assign;           // n: segment index of each ring
+    label nSeg = 0;
+    scalar scale = 1.0;
+    label si = -1;
 };
 
 int main(int argc, char *argv[])
 {
-    argList::addNote("Split-based boundary layers (WP 5.4-spike, full algorithm)");
+    argList::addNote("Split-based boundary layers (multi-row columns)");
     argList::addOption("spec", "file", "layer-spec JSON (contract 0.x)");
     argList::addOption("placement", "edge|normal",
-                       "ring-point placement (default: normal)");
+                       "single-cell-column placement (default: normal)");
     argList::addOption("optimizeSweeps", "N",
                        "tangential smoothing sweeps (default 10, 0=off)");
     argList::addOption("featureAngle", "deg",
@@ -192,9 +193,6 @@ int main(int argc, char *argv[])
     #include "createTime.H"
 
     Info<< "Create mesh for time = " << runTime.timeName() << nl << endl;
-    // polyMesh (not fvMesh): a pure mesh tool must not create solver-side
-    // artifacts (fvMesh::movePoints writes 0/meshPhi, which then breaks
-    // any subsequent tool run on the case — found 2026-06-12).
     polyMesh mesh
     (
         IOobject
@@ -222,109 +220,11 @@ int main(int argc, char *argv[])
     const cellList& cells = mesh.cells();
     const labelListList& cellEdges = mesh.cellEdges();
     const edgeList& meshEdges = mesh.edges();
+    const pointField& pts = mesh.points();
 
-    // mark cells owned by >1 target patch face (corner cells) -> skip
-    labelList patchFaceCount(mesh.nCells(), 0);
-
-    // ---- gather per-patch columns --------------------------------------
-    List<DynamicList<Column>> allColumns(specs.size());
-    List<label> skippedNonHex(specs.size(), 0);
-    List<label> skippedCorner(specs.size(), 0);
-
-    forAll(specs, si)
-    {
-        const label patchi = patches.findPatchID(specs[si].patchName);
-        if (patchi < 0)
-        {
-            FatalErrorInFunction
-                << "patch '" << specs[si].patchName << "' not found"
-                << exit(FatalError);
-        }
-        const polyPatch& pp = patches[patchi];
-        for (const label c : pp.faceCells()) { patchFaceCount[c]++; }
-    }
-
-    forAll(specs, si)
-    {
-        const polyPatch& pp = patches[patches.findPatchID(specs[si].patchName)];
-
-        forAll(pp, pfi)
-        {
-            const label fG = pp.start() + pfi;
-            const label own = mesh.faceOwner()[fG];
-
-            if (patchFaceCount[own] > 1)
-            {
-                ++skippedCorner[si];
-                continue;
-            }
-            const cell& c = cells[own];
-            if (c.size() != 6 || faces[fG].size() != 4)
-            {
-                ++skippedNonHex[si];
-                continue;
-            }
-            const label oppFi = c.opposingFaceLabel(fG, faces);
-            if (oppFi < 0 || faces[oppFi].size() != 4)
-            {
-                ++skippedNonHex[si];
-                continue;
-            }
-
-            Column col;
-            col.patchFacei = pfi;
-            col.meshFacei = fG;
-            col.celli = own;
-            col.oppFacei = oppFi;
-
-            const face& wf = faces[fG];
-            const face& of = faces[oppFi];
-            bool ok = true;
-            forAll(wf, k)
-            {
-                col.base[k] = wf[k];
-                // column edge: cell edge from wf[k] to a point of opp face
-                label qFound = -1;
-                for (const label ei : cellEdges[own])
-                {
-                    const edge& e = meshEdges[ei];
-                    const label other = e.otherVertex(wf[k]);
-                    if (other >= 0 && of.found(other))
-                    {
-                        qFound = other;
-                        break;
-                    }
-                }
-                if (qFound < 0) { ok = false; break; }
-                col.top[k] = qFound;
-            }
-            if (!ok)
-            {
-                ++skippedNonHex[si];
-                continue;
-            }
-            allColumns[si].append(col);
-        }
-
-        Info<< "SPLITLAYERS|patch|" << specs[si].patchName
-            << "|nFaces|" << pp.size()
-            << "|columns|" << allColumns[si].size()
-            << "|skippedNonHex|" << skippedNonHex[si]
-            << "|skippedCorner|" << skippedCorner[si]
-            << nl;
-    }
-
-    if (dryRun)
-    {
-        Info<< "SPLITLAYERS|result|dry-run-ok" << nl << "End\n" << endl;
-        return 0;
-    }
-
-    // ---- ring point creation (shared per column edge) -------------------
-    polyTopoChange meshMod(mesh);
-
-    // per spec: heights t_k
+    // heights
     List<scalarList> cumHeights(specs.size());
+    scalarList needed(specs.size());
     forAll(specs, si)
     {
         cumHeights[si].setSize(specs[si].nLayers);
@@ -335,9 +235,368 @@ int main(int argc, char *argv[])
             cumHeights[si][k] = t;
             h *= specs[si].expansion;
         }
+        // healthy remainder: continue the progression one more step
+        needed[si] = t + specs[si].firstHeight
+            * Foam::pow(specs[si].expansion, specs[si].nLayers);
     }
 
-    // smoothed normals per patch (point field, patch-local indexing)
+    labelList patchFaceCount(mesh.nCells(), 0);
+    forAll(specs, si)
+    {
+        const label patchi = patches.findPatchID(specs[si].patchName);
+        if (patchi < 0)
+        {
+            FatalErrorInFunction
+                << "patch '" << specs[si].patchName << "' not found"
+                << exit(FatalError);
+        }
+        for (const label c : patches[patchi].faceCells())
+        {
+            patchFaceCount[c]++;
+        }
+    }
+
+    // helper: is this cell a clean hex (6 quad faces)?
+    auto isHex = [&](const label celli) -> bool
+    {
+        const cell& c = cells[celli];
+        if (c.size() != 6) { return false; }
+        for (const label fi : c)
+        {
+            if (faces[fi].size() != 4) { return false; }
+        }
+        return true;
+    };
+
+    // helper: corner continuation pt -> next point on target face via a
+    // cell edge of celli
+    auto railStep = [&](const label celli, const label fromPt,
+                        const face& target) -> label
+    {
+        for (const label ei : cellEdges[celli])
+        {
+            const edge& e = meshEdges[ei];
+            const label other = e.otherVertex(fromPt);
+            if (other >= 0 && target.found(other)) { return other; }
+        }
+        return -1;
+    };
+
+    // ---- PASS 1: identification ----------------------------------------
+    DynamicList<Column> columns;
+    labelList claimed(mesh.nCells(), -1);
+    List<label> nCorner(specs.size(), 0), nNonHex(specs.size(), 0);
+
+    forAll(specs, si)
+    {
+        const polyPatch& pp = patches[patches.findPatchID(specs[si].patchName)];
+
+        forAll(pp, pfi)
+        {
+            const label fG = pp.start() + pfi;
+            const label own = mesh.faceOwner()[fG];
+
+            if (patchFaceCount[own] > 1) { ++nCorner[si]; continue; }
+            if (!isHex(own) || claimed[own] >= 0)
+            {
+                ++nNonHex[si];
+                continue;
+            }
+
+            Column col;
+            col.patchFacei = pfi;
+            col.meshFacei = fG;
+            col.si = si;
+
+            const face& wf = faces[fG];
+            label iface = cells[own].opposingFaceLabel(fG, faces);
+            if (iface < 0 || faces[iface].size() != 4)
+            {
+                ++nNonHex[si];
+                continue;
+            }
+
+            bool ok = true;
+            forAll(wf, c)
+            {
+                col.rails[c].append(wf[c]);
+                const label q = railStep(own, wf[c], faces[iface]);
+                if (q < 0) { ok = false; break; }
+                col.rails[c].append(q);
+            }
+            if (!ok) { ++nNonHex[si]; continue; }
+
+            col.chain.append(own);
+            claimed[own] = columns.size();
+
+            // extend while the shortest rail is shorter than needed
+            auto minRailLen = [&]() -> scalar
+            {
+                scalar L = GREAT;
+                forAll(col.rails, c)
+                {
+                    scalar s = 0;
+                    const labelList& r = col.rails[c];
+                    for (label j = 1; j < r.size(); ++j)
+                    {
+                        s += mag(pts[r[j]] - pts[r[j-1]]);
+                    }
+                    L = min(L, s);
+                }
+                return L;
+            };
+
+            while (minRailLen() < needed[si] && mesh.isInternalFace(iface))
+            {
+                const label cOwn = mesh.faceOwner()[iface];
+                const label cNei = mesh.faceNeighbour()[iface];
+                const label next = (cOwn == col.chain.last()) ? cNei : cOwn;
+                if (next < 0) { break; }
+                if (claimed[next] >= 0 || patchFaceCount[next] > 0
+                 || !isHex(next))
+                {
+                    break;
+                }
+                const label nextIface =
+                    cells[next].opposingFaceLabel(iface, faces);
+                if (nextIface < 0 || faces[nextIface].size() != 4) { break; }
+
+                bool stepOk = true;
+                FixedList<label, 4> qs;
+                forAll(col.rails, c)
+                {
+                    qs[c] = railStep(next, col.rails[c].last(),
+                                     faces[nextIface]);
+                    if (qs[c] < 0) { stepOk = false; break; }
+                }
+                if (!stepOk) { break; }
+
+                col.ifaces.append(iface);
+                col.chain.append(next);
+                claimed[next] = columns.size();
+                forAll(col.rails, c) { col.rails[c].append(qs[c]); }
+                iface = nextIface;
+            }
+            col.topFace = iface;
+            col.scale = min(scalar(1), minRailLen() / needed[si]);
+            columns.append(col);
+        }
+    }
+
+    // ---- PASS 2: conflict pre-passes ------------------------------------
+    // Rail identity = FIRST SEGMENT EDGE (base point + direction). Keying
+    // by base point alone is wrong at reentrant corner lines, where one
+    // wall point carries rails of two perpendicular columns (found
+    // 2026-06-12: teleported-vertex/bowtie faces along the bracket corner).
+    EdgeMap<RailData> railsOf;
+    auto railKey = [&](const Column& cl, const label c) -> edge
+    {
+        return edge(cl.rails[c][0], cl.rails[c][1]);
+    };
+    List<label> nConflict(specs.size(), 0), nWarp(specs.size(), 0),
+                nCross(specs.size(), 0);
+
+    // rail assignment for a column's rail c under the column's scale
+    auto computeAssign = [&](const Column& col, const label c) -> labelList
+    {
+        const labelList& r = col.rails[c];
+        scalarList arc(r.size(), Zero);
+        for (label j = 1; j < r.size(); ++j)
+        {
+            arc[j] = arc[j-1] + mag(pts[r[j]] - pts[r[j-1]]);
+        }
+        const scalarList& cum = cumHeights[col.si];
+        labelList assign(cum.size());
+        forAll(cum, k)
+        {
+            const scalar h = col.scale * cum[k];
+            label seg = 0;
+            while (seg + 2 < r.size() && h > arc[seg + 1]) { ++seg; }
+            assign[k] = seg;
+        }
+        return assign;
+    };
+
+    Map<label> sideFaceCol;   // side face -> column id (cross detection)
+    Map<label> topFaceCol;    // top face -> column id (head-on detection)
+
+    forAll(columns, ci)
+    {
+        Column& col = columns[ci];
+        if (col.skip) { continue; }
+        const label m = col.chain.size();
+
+        // (a) shared-rail consistency
+        bool conflict = false;
+        forAll(col.rails, c)
+        {
+            const auto it = railsOf.cfind(railKey(col, c));
+            if (it.good()
+             && (it.val().nSeg != m
+              || mag(it.val().scale - col.scale) > 1e-6 * col.scale + VSMALL))
+            {
+                conflict = true;
+            }
+        }
+        if (conflict)
+        {
+            col.skip = true; col.reason = "conflict";
+            ++nConflict[col.si];
+            continue;
+        }
+
+        // (b) warp: all four rails must agree on ring->segment assignment
+        const labelList a0 = computeAssign(col, 0);
+        bool warp = false;
+        for (label c = 1; c < 4 && !warp; ++c)
+        {
+            if (computeAssign(col, c) != a0) { warp = true; }
+        }
+        if (warp)
+        {
+            col.skip = true; col.reason = "warp";
+            ++nWarp[col.si];
+            continue;
+        }
+
+        // (c) crossing chains + face classification. Every face of every
+        // chain cell must be wall, interface, top, or a clean side face
+        // (two rails' (i,i+1) point pairs). Side faces claimed by another
+        // column must share rails (parallel chains); top faces meeting
+        // another column are only allowed HEAD-ON (top-to-top). Anything
+        // else: skip this column — a silently unhandled face leaves a
+        // deleted-owner error in polyTopoChange.
+        bool cross = false;
+        bool unclass = false;
+        forAll(col.chain, i)
+        {
+            for (const label fi : cells[col.chain[i]])
+            {
+                if (fi == col.meshFacei) { continue; }
+                if (col.ifaces.found(fi)) { continue; }
+                if (fi == col.topFace)
+                {
+                    // perpendicular meeting: our top is someone's side
+                    const auto its = sideFaceCol.cfind(fi);
+                    if (its.good() && its.val() != ci) { cross = true; }
+                    continue;
+                }
+
+                // must be a clean side face
+                label nr = 0;
+                forAll(col.rails, c)
+                {
+                    if (faces[fi].found(col.rails[c][i])
+                     && faces[fi].found(col.rails[c][i + 1]))
+                    {
+                        ++nr;
+                    }
+                }
+                if (nr != 2) { unclass = true; break; }
+
+                const auto it = sideFaceCol.cfind(fi);
+                if (it.good() && it.val() != ci)
+                {
+                    const Column& other = columns[it.val()];
+                    bool parallel = false;
+                    forAll(col.rails, c)
+                    {
+                        if (faces[fi].found(col.rails[c][i]))
+                        {
+                            forAll(other.rails, oc)
+                            {
+                                if (other.rails[oc].found(col.rails[c][i]))
+                                {
+                                    parallel = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!parallel) { cross = true; }
+                }
+                // our side face is someone's TOP face -> perpendicular
+                const auto itt = topFaceCol.cfind(fi);
+                if (itt.good() && itt.val() != ci) { cross = true; }
+            }
+            if (cross || unclass) { break; }
+        }
+        if (unclass)
+        {
+            col.skip = true; col.reason = "warp";
+            ++nWarp[col.si];
+            continue;
+        }
+        if (cross)
+        {
+            col.skip = true; col.reason = "cross";
+            ++nCross[col.si];
+            continue;
+        }
+        forAll(col.chain, i)
+        {
+            for (const label fi : cells[col.chain[i]])
+            {
+                if (fi != col.meshFacei && fi != col.topFace
+                 && !col.ifaces.found(fi))
+                {
+                    sideFaceCol.insert(fi, ci);
+                }
+            }
+        }
+        topFaceCol.insert(col.topFace, ci);
+
+        // record rails (tentative ring labels filled in PASS 3)
+        forAll(col.rails, c)
+        {
+            if (!railsOf.found(railKey(col, c)))
+            {
+                RailData rd;
+                rd.nSeg = m;
+                rd.scale = col.scale;
+                rd.si = col.si;
+                rd.assign = a0;
+                railsOf.insert(railKey(col, c), rd);
+            }
+        }
+    }
+
+    // report
+    {
+        List<label> nCols(specs.size(), 0), nMulti(specs.size(), 0);
+        forAll(columns, ci)
+        {
+            if (!columns[ci].skip)
+            {
+                ++nCols[columns[ci].si];
+                if (columns[ci].chain.size() > 1)
+                {
+                    ++nMulti[columns[ci].si];
+                }
+            }
+        }
+        forAll(specs, si)
+        {
+            Info<< "SPLITLAYERS|patch|" << specs[si].patchName
+                << "|nFaces|"
+                << patches[patches.findPatchID(specs[si].patchName)].size()
+                << "|columns|" << nCols[si]
+                << "|multiRow|" << nMulti[si]
+                << "|skippedNonHex|" << nNonHex[si]
+                << "|skippedCorner|" << nCorner[si]
+                << "|skippedConflict|" << nConflict[si]
+                << "|skippedWarp|" << nWarp[si]
+                << "|skippedCross|" << nCross[si]
+                << nl;
+        }
+    }
+
+    if (dryRun)
+    {
+        Info<< "SPLITLAYERS|result|dry-run-ok" << nl << "End\n" << endl;
+        return 0;
+    }
+
+    // smoothed normals per spec patch (single-cell-column placement)
     List<vectorField> patchNormals(specs.size());
     forAll(specs, si)
     {
@@ -348,274 +607,403 @@ int main(int argc, char *argv[])
             << "|featurePoints|" << nFeat << nl;
     }
 
-    // EdgeMap: column edge (p_base, p_top) -> list of new ring point labels
-    EdgeMap<labelList> ringPoints;
-    EdgeMap<label> edgeSpec;               // column edge -> spec index
+    // ---- PASS 3: ring creation ------------------------------------------
+    polyTopoChange meshMod(mesh);
+    EdgeMap<labelList> segRings;        // segment edge -> ordered ring pts
+    EdgeMap<label> edgeClaim;           // segment edge -> owning rail base
 
-    const pointField& pts = mesh.points();
-
-    forAll(specs, si)
+    label nEdgeConflict = 0;
+    forAll(columns, ci)
     {
-        const polyPatch& pp = patches[patches.findPatchID(specs[si].patchName)];
+        Column& col0 = columns[ci];
+        if (col0.skip) { continue; }
+
+        // Pre-check: a rail not yet created must not reuse a segment edge
+        // already claimed by a DIFFERENT rail (rails from different wall
+        // points can merge onto the same mesh edges at reentrant corners
+        // — found 2026-06-12: open-cell line along the bracket corner).
+        bool edgeConflict = false;
+        forAll(col0.rails, c)
+        {
+            if (railsOf[railKey(col0, c)].rings.size()) { continue; }
+            const label base = col0.rails[c][0];
+            const labelList& r = col0.rails[c];
+            for (label j = 0; j + 1 < r.size() && !edgeConflict; ++j)
+            {
+                const auto it = edgeClaim.cfind(edge(r[j], r[j+1]));
+                if (it.good() && it.val() != base) { edgeConflict = true; }
+            }
+            if (edgeConflict) { break; }
+        }
+        if (edgeConflict)
+        {
+            col0.skip = true;
+            col0.reason = "conflict";
+            ++nEdgeConflict;
+            continue;
+        }
+        forAll(col0.rails, c)
+        {
+            const labelList& r = col0.rails[c];
+            for (label j = 0; j + 1 < r.size(); ++j)
+            {
+                edgeClaim.insert(edge(r[j], r[j+1]), col0.rails[c][0]);
+            }
+        }
+
+        const Column& col = columns[ci];
+        const polyPatch& pp =
+            patches[patches.findPatchID(specs[col.si].patchName)];
         const scalar cosGuard = Foam::cos(degToRad(60.0));
 
-        for (const Column& col : allColumns[si])
+        forAll(col.rails, c)
         {
-            forAll(col.base, k)
+            const label base = col.rails[c][0];
+            RailData& rd = railsOf[railKey(col, c)];
+            if (rd.rings.size()) { continue; }   // already created
+
+            const labelList& r = col.rails[c];
+            scalarList arc(r.size(), Zero);
+            for (label j = 1; j < r.size(); ++j)
             {
-                const edge colEdge(col.base[k], col.top[k]);
-                if (ringPoints.found(colEdge)) { continue; }
+                arc[j] = arc[j-1] + mag(pts[r[j]] - pts[r[j-1]]);
+            }
 
-                const point& p = pts[col.base[k]];
-                const point& q = pts[col.top[k]];
-                const vector edgeDir = (q - p) / max(mag(q - p), SMALL);
-                const scalar edgeLen = mag(q - p);
-
-                vector dir = edgeDir;
-                if (placement == "normal")
+            // single-cell columns may use smoothed-normal placement
+            vector dir = Zero;
+            bool useDir = false;
+            if (r.size() == 2 && placement == "normal")
+            {
+                const vector edgeDir =
+                    (pts[r[1]] - pts[r[0]]) / max(arc.last(), VSMALL);
+                const label loc = pp.whichPoint(base);
+                if (loc >= 0)
                 {
-                    const label loc = pp.whichPoint(col.base[k]);
-                    if (loc >= 0)
+                    const vector& ns = patchNormals[col.si][loc];
+                    if ((ns & edgeDir) > cosGuard)
                     {
-                        const vector& ns = patchNormals[si][loc];
-                        if ((ns & edgeDir) > cosGuard) { dir = ns; }
+                        dir = ns;
+                        useDir = true;
                     }
                 }
-
-                // Compress if the column is too short for the stack. The
-                // scale is chosen so the REMAINDER cell continues the
-                // geometric progression (~ last layer x er) instead of
-                // becoming a sliver (found 2026-06-12 on trimmed cfMesh
-                // wall cells: 0.1*L remainders wrecked the expansion
-                // ratio and cell quality).
-                const scalar total = cumHeights[si].last();
-                const scalar hLast =
-                    specs[si].firstHeight
-                  * Foam::pow(specs[si].expansion, specs[si].nLayers - 1);
-                scalar scaleH = 1.0;
-                if (total + hLast * specs[si].expansion > edgeLen)
-                {
-                    scaleH = edgeLen
-                           / (total + hLast * specs[si].expansion);
-                }
-
-                labelList ring(specs[si].nLayers);
-                forAll(ring, j)
-                {
-                    const point rp = p + dir * (scaleH * cumHeights[si][j]);
-                    ring[j] = meshMod.addPoint(rp, col.base[k], -1, true);
-                }
-                ringPoints.insert(colEdge, ring);
-                edgeSpec.insert(colEdge, si);
             }
-        }
-    }
 
-    // ---- cells: replace each split cell by n layers + remainder ---------
-    // newCells[celli] = list of n+1 new cell labels (wall-side first)
-    Map<labelList> newCells;
-
-    forAll(specs, si)
-    {
-        for (const Column& col : allColumns[si])
-        {
-            labelList stack(specs[si].nLayers + 1);
-            forAll(stack, j)
+            rd.rings.setSize(specs[col.si].nLayers);
+            forAll(rd.rings, k)
             {
-                stack[j] = meshMod.addCell(-1, -1, -1, col.celli, -1);
+                const scalar h = rd.scale * cumHeights[col.si][k];
+                point rp;
+                if (useDir)
+                {
+                    rp = pts[r[0]] + dir * h;
+                }
+                else
+                {
+                    const label seg = rd.assign[k];
+                    const scalar f =
+                        (h - arc[seg])
+                      / max(arc[seg + 1] - arc[seg], VSMALL);
+                    rp = pts[r[seg]] + f * (pts[r[seg + 1]] - pts[r[seg]]);
+                }
+                rd.rings[k] = meshMod.addPoint(rp, base, -1, true);
             }
-            meshMod.removeCell(col.celli, -1);
-            newCells.insert(col.celli, stack);
+
+            // register rings per segment edge for the lateral pass
+            forAll(r, j)
+            {
+                if (j + 1 >= r.size()) { break; }
+                DynamicList<label> inSeg;
+                forAll(rd.assign, k)
+                {
+                    if (rd.assign[k] == j) { inSeg.append(rd.rings[k]); }
+                }
+                if (inSeg.size())
+                {
+                    segRings.insert(edge(r[j], r[j+1]), labelList(inSeg));
+                }
+            }
         }
     }
 
-    // helper: ring point for (column edge, layer k)
-    auto ringAt = [&](const label basePt, const label topPt, const label j)
+    if (nEdgeConflict)
     {
-        return ringPoints[edge(basePt, topPt)][j];
-    };
+        Info<< "SPLITLAYERS|lateSkips|edgeConflict|" << nEdgeConflict << nl;
+    }
 
-    // ---- faces -----------------------------------------------------------
-    // For each split cell: wall face -> layer cell 0 (modify);
-    // ring faces between consecutive stack cells (add);
-    // opposing face -> remainder (handled in the generic pass below);
-    // side faces -> strips; lateral faces of unsplit neighbours -> point
-    // insertion. The generic pass walks every face of every split cell once.
+    // ---- PASS 4: topology -------------------------------------------------
+    Map<labelList> stackOf;     // column id -> n+1 new cell labels
+    Map<label> cellCol;         // chain cell -> column id
+    forAll(columns, ci)
+    {
+        const Column& col = columns[ci];
+        if (col.skip) { continue; }
+        const label n = specs[col.si].nLayers;
+        labelList stack(n + 1);
+        forAll(stack, j)
+        {
+            stack[j] = meshMod.addCell(-1, -1, -1, col.chain[0], -1);
+        }
+        for (const label cc : col.chain)
+        {
+            meshMod.removeCell(cc, -1);
+            cellCol.insert(cc, ci);
+        }
+        stackOf.insert(ci, stack);
+    }
 
     bitSet faceDone(mesh.nFaces(), false);
 
-    forAll(specs, si)
+    // Insert ring points of FOREIGN rails into a face polygon: at reentrant
+    // geometry edges a split column's side/top face can contain another
+    // column's rail segment as one of its edges (found 2026-06-12: open-
+    // cell line along the bracket's concave corner). Same walk as the
+    // lateral pass; own-rail edges never match segRings (their rings are
+    // already face boundaries, and ringless segments have no entry).
+    auto withForeignRings = [&](const face& f0) -> face
     {
-        const label patchi = patches.findPatchID(specs[si].patchName);
-        const label n = specs[si].nLayers;
-
-        for (const Column& col : allColumns[si])
+        DynamicList<label> nf(f0.size() + 16);
+        forAll(f0, k)
         {
-            const labelList& stack = newCells[col.celli];
-            const face& wf = faces[col.meshFacei];
-
-            // 1. wall face -> owner = first layer cell
-            if (!faceDone.test(col.meshFacei))
+            nf.append(f0[k]);
+            const edge fe(f0[k], f0.nextLabel(k));
+            const auto it = segRings.cfind(fe);
+            if (it.good())
             {
-                meshMod.modifyFace
-                (
-                    wf, col.meshFacei, stack[0], -1, false, patchi, -1, false
-                );
-                faceDone.set(col.meshFacei);
-            }
-
-            // 2. internal ring faces between stack cells
-            for (label j = 0; j < n; ++j)
-            {
-                face rf(4);
-                forAll(wf, k)
+                const labelList& ring = it.val();
+                if (f0[k] == it.key()[0])
                 {
-                    // reversed order so the normal points away from the wall
-                    rf[k] = ringAt(col.base[3 - k], col.top[3 - k], j);
+                    forAll(ring, j) { nf.append(ring[j]); }
                 }
-                meshMod.addFace
-                (
-                    rf, stack[j], stack[j + 1],
-                    -1, -1, col.meshFacei, false, -1, -1, false
-                );
+                else
+                {
+                    forAllReverse(ring, j) { nf.append(ring[j]); }
+                }
             }
+        }
+        return face(labelList(nf));
+    };
 
-            // 3. remaining original faces of this cell
-            const cell& c = cells[col.celli];
-            for (const label fi : c)
+    forAll(columns, ci)
+    {
+        const Column& col = columns[ci];
+        if (col.skip) { continue; }
+        const label n = specs[col.si].nLayers;
+        const label patchi = patches.findPatchID(specs[col.si].patchName);
+        const labelList& stack = stackOf[ci];
+        const labelList& assign = railsOf[railKey(col, 0)].assign;
+
+        // rings-before-segment table
+        labelList ringsBefore(col.chain.size() + 1, 0);
+        for (label i = 1; i <= col.chain.size(); ++i)
+        {
+            label cnt = 0;
+            forAll(assign, k) { if (assign[k] < i) { ++cnt; } }
+            ringsBefore[i] = cnt;
+        }
+
+        // 1. wall face
+        if (!faceDone.test(col.meshFacei))
+        {
+            meshMod.modifyFace(faces[col.meshFacei], col.meshFacei,
+                               stack[0], -1, false, patchi, -1, false);
+            faceDone.set(col.meshFacei);
+        }
+
+        // 2. ring faces (reversed wall-face order -> normal away from wall)
+        const face& wf = faces[col.meshFacei];
+        for (label k = 0; k < n; ++k)
+        {
+            face rf(4);
+            forAll(wf, c)
             {
-                if (fi == col.meshFacei || faceDone.test(fi)) { continue; }
+                rf[c] = railsOf[railKey(col, 3 - c)].rings[k];
+            }
+            meshMod.addFace(rf, stack[k], stack[k + 1],
+                            -1, -1, col.meshFacei, false, -1, -1, false);
+        }
+
+        // 3. interface faces absorbed
+        for (const label fi : col.ifaces)
+        {
+            if (!faceDone.test(fi))
+            {
+                meshMod.removeFace(fi, -1);
+                faceDone.set(fi);
+            }
+        }
+
+        // 4. top face -> remainder. Either side that is the LAST cell of a
+        // surviving column maps to that column's remainder cell — this
+        // also handles head-on chain meetings (top-to-top).
+        if (!faceDone.test(col.topFace))
+        {
+            const face& tf = faces[col.topFace];
+            auto remap = [&](const label celli) -> label
+            {
+                if (celli >= 0 && cellCol.found(celli))
+                {
+                    const label oc = cellCol[celli];
+                    if (!columns[oc].skip
+                     && columns[oc].chain.last() == celli)
+                    {
+                        return stackOf[oc][specs[columns[oc].si].nLayers];
+                    }
+                }
+                return celli;
+            };
+            const face tfr = withForeignRings(tf);
+            const label ownO = mesh.faceOwner()[col.topFace];
+            if (mesh.isInternalFace(col.topFace))
+            {
+                const label neiO = mesh.faceNeighbour()[col.topFace];
+                meshMod.modifyFace(tfr, col.topFace,
+                    remap(ownO), remap(neiO), false, -1, -1, false);
+            }
+            else
+            {
+                meshMod.modifyFace(tfr, col.topFace, stack[n], -1, false,
+                                   patches.whichPatch(col.topFace),
+                                   -1, false);
+            }
+            faceDone.set(col.topFace);
+        }
+
+        // 5. side faces, per chain cell, partitioned by assigned rings
+        forAll(col.chain, i)
+        {
+            for (const label fi : cells[col.chain[i]])
+            {
+                if (faceDone.test(fi)) { continue; }
+                if (fi == col.meshFacei || fi == col.topFace) { continue; }
+                if (col.ifaces.found(fi)) { continue; }
 
                 const face& f = faces[fi];
-                const label ownO = mesh.faceOwner()[fi];
-                const bool isOwner = (ownO == col.celli);
-                const label other =
-                    mesh.isInternalFace(fi)
-                  ? (isOwner ? mesh.faceNeighbour()[fi] : ownO)
-                  : -1;
 
-                if (fi == col.oppFacei)
+                // which rails does this face touch?
+                FixedList<label, 4> railIdx(-1);
+                label nr = 0;
+                forAll(col.rails, c)
                 {
-                    // opposing face -> remainder cell
-                    const label nei =
-                        (other >= 0 && newCells.found(other))
-                      ? newCells[other][specs[si].nLayers]  // unlikely; guard
-                      : other;
-                    if (isOwner)
+                    if (f.found(col.rails[c][i])
+                     && f.found(col.rails[c][i + 1]))
                     {
-                        meshMod.modifyFace(f, fi, stack[n], nei, false,
-                            mesh.isInternalFace(fi) ? -1
-                            : patches.whichPatch(fi), -1, false);
+                        railIdx[nr++] = c;
+                    }
+                }
+                if (nr != 2) { continue; }   // not a clean side face
+
+                const label ca = railIdx[0], cb = railIdx[1];
+                DynamicList<label> cutK;
+                forAll(assign, k)
+                {
+                    if (assign[k] == i) { cutK.append(k); }
+                }
+
+                const label ownO = mesh.faceOwner()[fi];
+                const label neiO = mesh.isInternalFace(fi)
+                                 ? mesh.faceNeighbour()[fi] : -1;
+                const label other =
+                    (ownO == col.chain[i]) ? neiO : ownO;
+                const bool otherSplit =
+                    (other >= 0 && cellCol.found(other)
+                  && !columns[cellCol[other]].skip);
+                label otherSeg = -1;
+                if (otherSplit)
+                {
+                    otherSeg = columns[cellCol[other]].chain.find(other);
+                }
+
+                const label nSub = cutK.size() + 1;
+                for (label s = 0; s < nSub; ++s)
+                {
+                    auto pickPt = [&](const label c, const bool lower)
+                        -> label
+                    {
+                        const label idx = lower ? s - 1 : s;
+                        if (lower && s == 0)
+                        {
+                            return col.rails[c][i];
+                        }
+                        if (!lower && s == nSub - 1)
+                        {
+                            return col.rails[c][i + 1];
+                        }
+                        return railsOf[railKey(col, c)].rings[cutK[idx]];
+                    };
+
+                    face sf(f.size());
+                    forAll(f, k)
+                    {
+                        label p = f[k];
+                        if (p == col.rails[ca][i]) { p = pickPt(ca, true); }
+                        else if (p == col.rails[ca][i+1])
+                        {
+                            p = pickPt(ca, false);
+                        }
+                        else if (p == col.rails[cb][i])
+                        {
+                            p = pickPt(cb, true);
+                        }
+                        else if (p == col.rails[cb][i+1])
+                        {
+                            p = pickPt(cb, false);
+                        }
+                        sf[k] = p;
+                    }
+
+                    const label stackIdx = ringsBefore[i] + s;
+                    label sOwn = ownO, sNei = neiO;
+                    if (sOwn == col.chain[i]) { sOwn = stack[stackIdx]; }
+                    else if (otherSplit && sOwn == other)
+                    {
+                        const labelList& oStack = stackOf[cellCol[other]];
+                        const labelList& oAssign =
+                            railsOf[railKey(columns[cellCol[other]], 0)]
+                                .assign;
+                        label oBefore = 0;
+                        forAll(oAssign, k)
+                        {
+                            if (oAssign[k] < otherSeg) { ++oBefore; }
+                        }
+                        sOwn = oStack[oBefore + s];
+                    }
+                    if (sNei == col.chain[i]) { sNei = stack[stackIdx]; }
+                    else if (otherSplit && sNei == other)
+                    {
+                        const labelList& oStack = stackOf[cellCol[other]];
+                        const labelList& oAssign =
+                            railsOf[railKey(columns[cellCol[other]], 0)]
+                                .assign;
+                        label oBefore = 0;
+                        forAll(oAssign, k)
+                        {
+                            if (oAssign[k] < otherSeg) { ++oBefore; }
+                        }
+                        sNei = oStack[oBefore + s];
+                    }
+                    const label sPatch = mesh.isInternalFace(fi)
+                                       ? -1 : patches.whichPatch(fi);
+
+                    const face sfr = withForeignRings(sf);
+                    if (s == 0)
+                    {
+                        meshMod.modifyFace(sfr, fi, sOwn, sNei, false,
+                                           sPatch, -1, false);
                     }
                     else
                     {
-                        meshMod.modifyFace(f, fi, nei, stack[n], false,
-                            -1, -1, false);
-                    }
-                    faceDone.set(fi);
-                    continue;
-                }
-
-                // side face: contains exactly 2 base + 2 top points
-                label ia = -1, ib = -1;
-                forAll(col.base, k)
-                {
-                    if (f.found(col.base[k]))
-                    {
-                        (ia < 0 ? ia : ib) = k;
+                        meshMod.addFace(sfr, sOwn, sNei,
+                                        -1, -1, fi, false, sPatch, -1, false);
                     }
                 }
-
-                if (ia >= 0 && ib >= 0)
-                {
-                    // Strip-split this side face by POINT SUBSTITUTION on
-                    // the original face: winding (and therefore the
-                    // owner/neighbour orientation convention) is inherited
-                    // from f. Levels: 0 = wall points, k = ring k-1,
-                    // n+1 = top points; strip j spans level j..j+1.
-                    const bool otherSplit =
-                        (other >= 0 && newCells.found(other));
-
-                    auto levelPoint =
-                        [&](const label meshPt, const label lev) -> label
-                    {
-                        forAll(col.base, k)
-                        {
-                            if (meshPt == col.base[k])
-                            {
-                                return (lev == 0)
-                                    ? col.base[k]
-                                    : ringAt(col.base[k], col.top[k], lev-1);
-                            }
-                            if (meshPt == col.top[k])
-                            {
-                                return (lev == n + 1)
-                                    ? col.top[k]
-                                    : ringAt(col.base[k], col.top[k], lev-1);
-                            }
-                        }
-                        return meshPt;   // not on a column edge (impossible
-                                         // for a hex side face, but safe)
-                    };
-
-                    for (label j = 0; j <= n; ++j)
-                    {
-                        face sf(f.size());
-                        forAll(f, k)
-                        {
-                            // wall-side points of f -> level j,
-                            // top-side points of f -> level j+1
-                            bool isBase = false;
-                            forAll(col.base, m)
-                            {
-                                if (f[k] == col.base[m]) { isBase = true; }
-                            }
-                            sf[k] = levelPoint(f[k], isBase ? j : j + 1);
-                        }
-
-                        // ownership: replace celli by stack[j]; if the
-                        // other side is split too, replace it by its j-th
-                        // stack cell; otherwise keep the original label.
-                        label sOwn = ownO;
-                        label sNei = mesh.isInternalFace(fi)
-                                   ? mesh.faceNeighbour()[fi] : -1;
-                        if (sOwn == col.celli) { sOwn = stack[j]; }
-                        else if (otherSplit && sOwn == other)
-                        {
-                            sOwn = newCells[other][j];
-                        }
-                        if (sNei == col.celli) { sNei = stack[j]; }
-                        else if (otherSplit && sNei == other)
-                        {
-                            sNei = newCells[other][j];
-                        }
-                        const label sPatch = mesh.isInternalFace(fi)
-                                           ? -1 : patches.whichPatch(fi);
-
-                        if (j == 0)
-                        {
-                            meshMod.modifyFace(sf, fi, sOwn, sNei, false,
-                                sPatch, -1, false);
-                        }
-                        else
-                        {
-                            meshMod.addFace(sf, sOwn, sNei,
-                                -1, -1, fi, false, sPatch, -1, false);
-                        }
-                    }
-                    faceDone.set(fi);
-                }
+                faceDone.set(fi);
             }
         }
     }
 
-    // ---- lateral faces of UNSPLIT cells touching column edges -----------
-    // Insert ring points into their polygons (no hanging nodes). A face may
-    // touch SEVERAL split column edges (e.g. corner-cell faces between two
-    // split neighbours) — collect the face set first, then walk each face
-    // once and insert the rings of every column edge it contains.
+    // ---- lateral faces of unsplit cells: insert ring points --------------
     labelHashSet lateralFaces;
-    forAllConstIters(ringPoints, iter)
+    forAllConstIters(segRings, iter)
     {
         const edge& ce = iter.key();
         label meshEdgei = -1;
@@ -638,11 +1026,11 @@ int main(int argc, char *argv[])
         {
             nf.append(f[k]);
             const edge fe(f[k], f.nextLabel(k));
-            const auto it = ringPoints.cfind(fe);
+            const auto it = segRings.cfind(fe);
             if (it.good())
             {
                 const labelList& ring = it.val();
-                if (f[k] == it.key()[0])    // stored as (base, top)
+                if (f[k] == it.key()[0])
                 {
                     forAll(ring, j) { nf.append(ring[j]); }
                 }
@@ -664,27 +1052,21 @@ int main(int argc, char *argv[])
         faceDone.set(fi);
     }
 
-    // ---- apply -----------------------------------------------------------
+    // ---- apply ------------------------------------------------------------
     autoPtr<mapPolyMesh> map = meshMod.changeMesh(mesh, false);
     mesh.updateMesh(map());
 
     Info<< "SPLITLAYERS|topology|cells|" << mesh.nCells()
         << "|points|" << mesh.nPoints() << nl;
 
-    // ---- node-position optimization (tangential Laplacian, radial fix) --
+    // ---- offset-vector smoothing (wall points fixed) ----------------------
     if (nOptSweeps > 0)
     {
         pointField newPts(mesh.points());
-
-        // Recover the ring points in FINAL numbering: every ring point was
-        // added with its wall point as master, so pointMap (new->old) sends
-        // it to the old wall-point label. Per column edge: collect all new
-        // points mapping to the old base label, drop the base itself, sort
-        // by distance from the (fixed) base point -> layer order.
         const labelList& pointMap = map().pointMap();
         const labelList& revPointMap = map().reversePointMap();
 
-        Map<DynamicList<label>> children;   // old base label -> new points
+        Map<DynamicList<label>> children;
         forAll(pointMap, np)
         {
             const label oldp = pointMap[np];
@@ -695,51 +1077,39 @@ int main(int argc, char *argv[])
         }
 
         DynamicList<label> inserted;
-        DynamicList<label> insBase, insK, insSpec;
-        forAllConstIters(ringPoints, iter)
+        DynamicList<label> insBase, insK;
+        forAllConstIters(railsOf, iter)
         {
-            const label b = iter.key()[0];   // edge stores base point first
+            const label b = iter.key()[0];   // rail key = (base, 1st joint)
+            if (!iter.val().rings.size()) { continue; }
             if (!children.found(b)) { continue; }
+            // corner-line bases carry TWO rails: their children mix both
+            // rails' rings and cannot be layer-indexed by distance alone —
+            // leave those unoptimized (v1)
+            if (children[b].size() != iter.val().rings.size()) { continue; }
             const label newBase = revPointMap[b];
-            DynamicList<label>& kids = children[b];
-            // sort by distance from base
-            labelList sorted(kids);
+            labelList sorted(children[b]);
             std::sort(sorted.begin(), sorted.end(),
                 [&](label x, label y)
                 {
                     return magSqr(newPts[x] - newPts[newBase])
                          < magSqr(newPts[y] - newPts[newBase]);
                 });
-            const label si = edgeSpec[iter.key()];
             forAll(sorted, j)
             {
-                if (j >= specs[si].nLayers) { break; }
+                if (j >= iter.val().rings.size()) { break; }
                 inserted.append(sorted[j]);
                 insBase.append(b);
                 insK.append(j);
-                insSpec.append(si);
             }
-            children.erase(b);   // each base belongs to one column edge
         }
 
-        // neighbour structure: ring points sharing base-point adjacency is
-        // expensive to rebuild exactly; approximate neighbours = inserted
-        // points within the same layer connected by a mesh edge
         const labelListList& pointPoints = mesh.pointPoints();
-        Map<label> layerOf, specOf, baseOf;
-        forAll(inserted, i)
-        {
-            layerOf.insert(inserted[i], insK[i]);
-            specOf.insert(inserted[i], insSpec[i]);
-            baseOf.insert(inserted[i], insBase[i]);
-        }
-        // Smooth the OFFSET VECTORS (point - own base), not positions:
-        // neighbours exchange direction information only. Uniform regions
-        // are a fixed point (no drift, no stack rotation); at corners and
-        // feature edges directions blend — the intended behaviour.
+        Map<label> layerOf;
         labelList baseNewOf(newPts.size(), -1);
         forAll(inserted, i)
         {
+            layerOf.insert(inserted[i], insK[i]);
             baseNewOf[inserted[i]] = revPointMap[insBase[i]];
         }
         const Vector<label>& geomD = mesh.geometricD();
@@ -768,17 +1138,9 @@ int main(int argc, char *argv[])
                 const vector vOwn = newPts[np] - bp;
                 vector v = 0.5 * vOwn + 0.5 * acc[np] / cnt[np];
                 const scalar mv = mag(v);
-                if (mv > SMALL)
-                {
-                    // preserve this point's own (possibly compressed) height
-                    v *= mag(vOwn) / mv;
-                }
-                else
-                {
-                    v = vOwn;
-                }
+                if (mv > SMALL) { v *= mag(vOwn) / mv; }
+                else { v = vOwn; }
                 point target = bp + v;
-                // never move along empty (non-geometric) directions (2D)
                 for (direction cmpt = 0; cmpt < 3; ++cmpt)
                 {
                     if (geomD[cmpt] < 0) { target[cmpt] = newPts[np][cmpt]; }
