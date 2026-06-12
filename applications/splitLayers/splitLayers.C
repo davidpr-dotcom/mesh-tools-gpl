@@ -419,6 +419,7 @@ int main(int argc, char *argv[])
 
     Map<label> sideFaceCol;   // side face -> column id (cross detection)
     Map<label> topFaceCol;    // top face -> column id (head-on detection)
+    Map<label> ifaceCol;      // interface face -> column id (cross detection)
 
     forAll(columns, ci)
     {
@@ -473,12 +474,32 @@ int main(int argc, char *argv[])
             for (const label fi : cells[col.chain[i]])
             {
                 if (fi == col.meshFacei) { continue; }
-                if (col.ifaces.found(fi)) { continue; }
+                if (col.ifaces.found(fi))
+                {
+                    // our interface must not be anyone's side/top face
+                    // (perpendicular chains: B strips A's interface ->
+                    // A's remainder never closes — found 2026-06-12)
+                    const auto its = sideFaceCol.cfind(fi);
+                    const auto itt = topFaceCol.cfind(fi);
+                    if ((its.good() && its.val() != ci)
+                     || (itt.good() && itt.val() != ci))
+                    {
+                        cross = true;
+                        break;
+                    }
+                    continue;
+                }
                 if (fi == col.topFace)
                 {
                     // perpendicular meeting: our top is someone's side
+                    // or interface
                     const auto its = sideFaceCol.cfind(fi);
-                    if (its.good() && its.val() != ci) { cross = true; }
+                    const auto iti = ifaceCol.cfind(fi);
+                    if ((its.good() && its.val() != ci)
+                     || (iti.good() && iti.val() != ci))
+                    {
+                        cross = true;
+                    }
                     continue;
                 }
 
@@ -514,9 +535,11 @@ int main(int argc, char *argv[])
                     }
                     if (!parallel) { cross = true; }
                 }
-                // our side face is someone's TOP face -> perpendicular
+                // our side face is someone's TOP or INTERFACE face
                 const auto itt = topFaceCol.cfind(fi);
                 if (itt.good() && itt.val() != ci) { cross = true; }
+                const auto iti = ifaceCol.cfind(fi);
+                if (iti.good() && iti.val() != ci) { cross = true; }
             }
             if (cross || unclass) { break; }
         }
@@ -544,6 +567,7 @@ int main(int argc, char *argv[])
             }
         }
         topFaceCol.insert(col.topFace, ci);
+        for (const label fi : col.ifaces) { ifaceCol.insert(fi, ci); }
 
         // record rails (tentative ring labels filled in PASS 3)
         forAll(col.rails, c)
@@ -611,6 +635,7 @@ int main(int argc, char *argv[])
     polyTopoChange meshMod(mesh);
     EdgeMap<labelList> segRings;        // segment edge -> ordered ring pts
     EdgeMap<label> edgeClaim;           // segment edge -> owning rail base
+    Map<point> newPtPos;                // topo point label -> coordinates
 
     label nEdgeConflict = 0;
     forAll(columns, ci)
@@ -706,6 +731,7 @@ int main(int argc, char *argv[])
                     rp = pts[r[seg]] + f * (pts[r[seg + 1]] - pts[r[seg]]);
                 }
                 rd.rings[k] = meshMod.addPoint(rp, base, -1, true);
+                newPtPos.insert(rd.rings[k], rp);
             }
 
             // register rings per segment edge for the lateral pass
@@ -783,6 +809,47 @@ int main(int argc, char *argv[])
         return face(labelList(nf));
     };
 
+    // construction-time sanity: every face we build must stay within the
+    // size neighbourhood of the original face it derives from. Violations
+    // identify the construct directly (debug aid; cheap enough to keep on).
+    label nInsane = 0;
+    auto saneCheck = [&](const face& nf, const label origFace,
+                         const label ci2, const char* tag)
+    {
+        if (nInsane >= 20) { return; }
+        const face& f0 = faces[origFace];
+        scalar d0 = 0;
+        forAll(f0, a)
+        {
+            for (label b2 = a + 1; b2 < f0.size(); ++b2)
+            {
+                d0 = max(d0, magSqr(pts[f0[a]] - pts[f0[b2]]));
+            }
+        }
+        auto coordOf = [&](const label p) -> point
+        {
+            return (p < pts.size() && !newPtPos.found(p))
+                 ? pts[p] : newPtPos[p];
+        };
+        scalar d1 = 0;
+        forAll(nf, a)
+        {
+            for (label b2 = a + 1; b2 < nf.size(); ++b2)
+            {
+                d1 = max(d1, magSqr(coordOf(nf[a]) - coordOf(nf[b2])));
+            }
+        }
+        if (d1 > 9.0 * d0 + SMALL)
+        {
+            ++nInsane;
+            Info<< "SPLITLAYERS|INSANE|" << tag
+                << "|col|" << ci2
+                << "|origFace|" << origFace
+                << "|spread|" << Foam::sqrt(d1) / max(Foam::sqrt(d0), VSMALL)
+                << "|pts|" << nf << nl;
+        }
+    };
+
     forAll(columns, ci)
     {
         const Column& col = columns[ci];
@@ -818,6 +885,7 @@ int main(int argc, char *argv[])
             {
                 rf[c] = railsOf[railKey(col, 3 - c)].rings[k];
             }
+            saneCheck(rf, col.meshFacei, ci, "ring");
             meshMod.addFace(rf, stack[k], stack[k + 1],
                             -1, -1, col.meshFacei, false, -1, -1, false);
         }
@@ -852,6 +920,7 @@ int main(int argc, char *argv[])
                 return celli;
             };
             const face tfr = withForeignRings(tf);
+            saneCheck(tfr, col.topFace, ci, "top");
             const label ownO = mesh.faceOwner()[col.topFace];
             if (mesh.isInternalFace(col.topFace))
             {
@@ -985,6 +1054,7 @@ int main(int argc, char *argv[])
                                        ? -1 : patches.whichPatch(fi);
 
                     const face sfr = withForeignRings(sf);
+                    saneCheck(sfr, fi, ci, "strip");
                     if (s == 0)
                     {
                         meshMod.modifyFace(sfr, fi, sOwn, sNei, false,
@@ -1043,9 +1113,11 @@ int main(int argc, char *argv[])
         const label ownO = mesh.faceOwner()[fi];
         const label neiO =
             mesh.isInternalFace(fi) ? mesh.faceNeighbour()[fi] : -1;
+        const face nfF{labelList(nf)};
+        saneCheck(nfF, fi, -1, "lateral");
         meshMod.modifyFace
         (
-            face(labelList(nf)), fi, ownO, neiO, false,
+            nfF, fi, ownO, neiO, false,
             mesh.isInternalFace(fi) ? -1 : patches.whichPatch(fi),
             -1, false
         );

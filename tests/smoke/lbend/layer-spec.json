@@ -1,0 +1,13 @@
+{
+  "contract": "layer-spec",
+  "version": "0.1.0",
+  "geometryHash": "lbend-multirow-repro",
+  "patches": [
+    {
+      "name": "body",
+      "nLayers": 5,
+      "firstLayerHeight": 0.0012,
+      "expansionRatio": 1.2
+    }
+  ]
+}

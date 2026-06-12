@@ -1,0 +1,77 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| L-bend multi-row reproducer: fluid fills an L; the two reentrant inner     |
+| walls are the layer patch ("body"). Uniform 5 mm cells.                    |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+scale 0.001;   // mm
+
+vertices
+(
+    ( 0  0  0)   // 0
+    (20  0  0)   // 1
+    (60  0  0)   // 2
+    (60 20  0)   // 3
+    (20 20  0)   // 4
+    ( 0 20  0)   // 5
+    (20 60  0)   // 6
+    ( 0 60  0)   // 7
+    ( 0  0 20)   // 8
+    (20  0 20)   // 9
+    (60  0 20)   // 10
+    (60 20 20)   // 11
+    (20 20 20)   // 12
+    ( 0 20 20)   // 13
+    (20 60 20)   // 14
+    ( 0 60 20)   // 15
+);
+
+blocks
+(
+    // graded consistently across block joints: wall cells shrink toward
+    // the inner (body) walls -> varied chain lengths and compression
+    hex (0 1 4 5  8  9 12 13) (4 4 4) simpleGrading (0.35 0.35 1) // A corner
+    hex (1 2 3 4  9 10 11 12) (8 4 4) simpleGrading (1 0.35 1)    // B right arm
+    hex (5 4 6 7 13 12 14 15) (4 8 4) simpleGrading (0.35 1 1)    // C upper arm
+);
+
+boundary
+(
+    body
+    {
+        type wall;
+        faces
+        (
+            (4 3 11 12)    // B y-max: inner wall along the right arm
+            (4 6 14 12)    // C x-max: inner wall along the upper arm
+            (1 2 10 9)     // B y-min: OPPOSING wall -> chains collide
+        );
+    }
+    farfield
+    {
+        type wall;
+        faces
+        (
+            (0 5 13 8)     // A x-min
+            (0 1 9 8)      // A y-min
+            (2 3 11 10)    // B x-max
+            (6 7 15 14)    // C y-max
+            (5 7 15 13)    // C x-min
+            (0 1 4 5)      // z-min
+            (1 2 3 4)
+            (5 4 6 7)
+            (8 9 12 13)    // z-max
+            (9 10 11 12)
+            (13 12 14 15)
+        );
+    }
+);
+
+// ************************************************************************* //
