@@ -1,0 +1,30 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    container:
+      image: opencfd/openfoam-default:2512
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build splitLayers
+        shell: bash
+        run: |
+          set -e
+          source /openfoam/bash.rc
+          mkdir -p "$FOAM_USER_APPBIN"
+          wmake applications/splitLayers
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -e
+          source /openfoam/bash.rc
+          bash tests/smoke/run.sh

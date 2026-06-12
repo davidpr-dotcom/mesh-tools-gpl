@@ -1,0 +1,19 @@
+{
+  "contract": "layer-spec",
+  "version": "0.1.0",
+  "geometryHash": "smoke-test-cavity",
+  "patches": [
+    {
+      "name": "movingWall",
+      "nLayers": 5,
+      "firstLayerHeight": 0.0005,
+      "expansionRatio": 1.2
+    },
+    {
+      "name": "fixedWalls",
+      "nLayers": 5,
+      "firstLayerHeight": 0.0005,
+      "expansionRatio": 1.2
+    }
+  ]
+}

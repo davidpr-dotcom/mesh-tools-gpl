@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zefra.dev/contracts/layer-spec/0.1.0",
+  "title": "layer-spec",
+  "description": "Per-patch boundary-layer specification consumed by splitLayers. Produced by the engine's layer planner (WP 5.1). Versioned per D7: tools reject specs whose major version they do not support.",
+  "type": "object",
+  "required": ["contract", "version", "patches"],
+  "properties": {
+    "contract": { "const": "layer-spec" },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semver of this contract instance"
+    },
+    "geometryHash": {
+      "type": "string",
+      "description": "Provenance: hash of the geometry this spec was planned for"
+    },
+    "patches": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "nLayers", "firstLayerHeight", "expansionRatio"],
+        "properties": {
+          "name": { "type": "string" },
+          "nLayers": { "type": "integer", "minimum": 1 },
+          "firstLayerHeight": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Absolute height of the wall-adjacent layer [m]"
+          },
+          "expansionRatio": { "type": "number", "minimum": 1.0 },
+          "zones": {
+            "type": "array",
+            "description": "Optional per-faceZone overrides (collision-reduced or collapse-predicted zones from the planner)",
+            "items": {
+              "type": "object",
+              "required": ["faceZone"],
+              "properties": {
+                "faceZone": { "type": "string" },
+                "nLayers": { "type": "integer", "minimum": 0 },
+                "totalThicknessFactor": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "maximum": 1.0,
+                  "description": "Planner-computed thickness reduction (collision field)"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

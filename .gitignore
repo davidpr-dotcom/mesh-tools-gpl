@@ -1,0 +1,19 @@
+# wmake build artifacts
+lnInclude/
+**/Make/linux*/
+**/Make/*Gcc*/
+**/Make/*Clang*/
+*.dep
+platforms/
+
+# OpenFOAM case clutter (smoke tests regenerate)
+tests/**/constant/polyMesh/
+tests/**/processor*/
+tests/**/log.*
+tests/**/postProcessing/
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

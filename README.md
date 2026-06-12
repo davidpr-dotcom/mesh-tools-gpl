@@ -1,0 +1,49 @@
+# mesh-tools-gpl
+
+OpenFOAM/cfMesh-linked command-line utilities supporting the Zefra meshing
+engine. **GPL-3.0** — every binary in this repository compiles against
+OpenFOAM (and, where noted, cfMesh) libraries and is published under their
+license terms from day one (engine plan decision D10).
+
+## What this repo is — and is not
+
+These tools contain **zero proprietary intelligence**. They are mechanical
+executors: each reads a versioned, schema-validated spec file (see
+`etc/contracts/`), performs a mesh operation with OpenFOAM library calls, and
+writes results plus structured diagnostics. All planning logic (sizing,
+layer specs, retry policy) lives in a separate proprietary engine that
+communicates with these tools **only via files across a process boundary**
+(decision D7). No linking, no shared memory, no IPC. See `COMPLIANCE.md`.
+
+## Tools
+
+| Tool | Status | Purpose |
+|------|--------|---------|
+| `splitLayers` | prototype (WP 5.4-spike) | Split wall-adjacent hex cells into geometrically graded boundary layers; optional node-position optimization pass |
+| `layerZoneExtract` | planned (WP 5.3) | Emit protected cellZones for AMR from layer-cell reports |
+| `refinementFieldWriter` | planned (WP 7.2) | Error-indicator fields for dynamicRefineFvMesh |
+
+## Building
+
+Requires a sourced OpenFOAM environment (tested against OpenFOAM v2406+).
+
+```sh
+# WSL2 / any sourced OpenFOAM shell
+wmake applications/splitLayers
+```
+
+CI builds run inside the `opencfd/openfoam-default` Docker image — see
+`.github/workflows/build.yml`.
+
+## Layout
+
+```
+applications/   one directory per utility (wmake-built)
+etc/contracts/  versioned JSON schemas for spec files (semver, D7)
+tests/smoke/    minimal cases exercising each tool end-to-end
+```
+
+## License
+
+GPL-3.0-or-later. See `LICENSE`.
+OpenFOAM is a registered trademark of OpenCFD Ltd.
