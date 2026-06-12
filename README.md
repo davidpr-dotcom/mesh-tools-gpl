@@ -19,7 +19,7 @@ communicates with these tools **only via files across a process boundary**
 
 | Tool | Status | Purpose |
 |------|--------|---------|
-| `splitLayers` | prototype (WP 5.4-spike) | Split wall-adjacent hex cells into geometrically graded boundary layers; optional node-position optimization pass |
+| `splitLayers` | working prototype (WP 5.4-spike) | Split wall-adjacent hex cells into geometrically graded boundary layers: ring-point insertion along columns, smoothed-normal or edge placement (`-placement`), offset-vector smoothing optimizer (`-optimizeSweeps`). Verified by the cavity smoke test in all ablation modes |
 | `layerZoneExtract` | planned (WP 5.3) | Emit protected cellZones for AMR from layer-cell reports |
 | `refinementFieldWriter` | planned (WP 7.2) | Error-indicator fields for dynamicRefineFvMesh |
 
@@ -46,4 +46,6 @@ tests/smoke/    minimal cases exercising each tool end-to-end
 ## License
 
 GPL-3.0-or-later. See `LICENSE`.
+Vendored third-party code: `applications/splitLayers/json.hpp`
+(nlohmann/json v3.11.3, MIT license — GPL-compatible).
 OpenFOAM is a registered trademark of OpenCFD Ltd.
