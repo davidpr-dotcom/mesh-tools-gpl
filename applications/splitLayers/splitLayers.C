@@ -382,10 +382,22 @@ int main(int argc, char *argv[])
                     }
                 }
 
-                // compress if the column is too short for the stack
+                // Compress if the column is too short for the stack. The
+                // scale is chosen so the REMAINDER cell continues the
+                // geometric progression (~ last layer x er) instead of
+                // becoming a sliver (found 2026-06-12 on trimmed cfMesh
+                // wall cells: 0.1*L remainders wrecked the expansion
+                // ratio and cell quality).
                 const scalar total = cumHeights[si].last();
-                const scalar scaleH =
-                    (total < 0.9 * edgeLen) ? 1.0 : 0.9 * edgeLen / total;
+                const scalar hLast =
+                    specs[si].firstHeight
+                  * Foam::pow(specs[si].expansion, specs[si].nLayers - 1);
+                scalar scaleH = 1.0;
+                if (total + hLast * specs[si].expansion > edgeLen)
+                {
+                    scaleH = edgeLen
+                           / (total + hLast * specs[si].expansion);
+                }
 
                 labelList ring(specs[si].nLayers);
                 forAll(ring, j)
