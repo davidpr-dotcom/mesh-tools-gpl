@@ -24,7 +24,14 @@ review per D11).
 
 ## Review trail
 
-- Architecture (process-boundary) opinion: attorney review scheduled
-  Phase 2, Weeks 8–11 (D11). Opinion to be kept on file, referenced here.
-- CGAL Alpha Wrapping commercial license (D1): separate executor
-  (`wrap-cgal`), not part of this repository.
+- Architecture (process-boundary) opinion: attorney review (D11), re-scoped per
+  R8.3 to also cover GPL-oracle internal use + the clean-room protocol. Status,
+  attorney questions, and the full third-party license register live in
+  `Zefra/2026-06-13-trackB-legal-checkpoint.md`. Opinion to be kept on file,
+  referenced here.
+- CGAL Alpha Wrapping (D1 → **D1-rev**, 2026-06-12): the commercial license is
+  **not** pursued. CGAL is used only as an INTERNAL, never-distributed black-box
+  test ORACLE — clean-room (public API + the published paper only; the
+  `Alpha_wrap` source is never read), kept outside this repo and the proprietary
+  engine. The MVP wrapper is OpenVDB (`wrap-vdb`, MPL-2.0); the in-house
+  `wrap-zefra` (Geogram/BSD) is the Track-W path to a proprietary primary.
