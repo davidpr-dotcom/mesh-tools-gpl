@@ -195,6 +195,9 @@ int main(int argc, char *argv[])
                        "tangential smoothing sweeps (default 10, 0=off)");
     argList::addOption("featureAngle", "deg",
                        "feature-point detection angle (default 45)");
+    argList::addOption("convexRidgeAngle", "deg",
+                       "convex-ridge skip threshold, I0.1 (default 70; sharper "
+                       "= fewer skips; only edges this convex are demoted)");
     argList::addBoolOption("dryRun", "identify and report columns only");
     argList::addBoolOption("debugDump",
         "write constant/splitLayersDebugMap: finalFace origFace tag column");
@@ -222,6 +225,7 @@ int main(int argc, char *argv[])
     const word placement = args.getOrDefault<word>("placement", "normal");
     const label nOptSweeps = args.getOrDefault<label>("optimizeSweeps", 10);
     const scalar featAngle = args.getOrDefault<scalar>("featureAngle", 45.0);
+    const scalar convexAngle = args.getOrDefault<scalar>("convexRidgeAngle", 70.0);
     const bool dryRun = args.found("dryRun");
     const bool debugDump = args.found("debugDump");
 
@@ -425,6 +429,7 @@ int main(int argc, char *argv[])
     };
     List<label> nConflict(specs.size(), 0), nWarp(specs.size(), 0),
                 nCross(specs.size(), 0);
+    List<label> nConvex(specs.size(), 0);        // skippedConvexRidge (I0.1)
 
     // rail assignment for a column's rail c under the column's scale
     auto computeAssign = [&](const Column& col, const label c) -> labelList
@@ -455,6 +460,48 @@ int main(int argc, char *argv[])
     {
         Column& col = columns[ci];
         if (col.skip) { continue; }
+
+        // --- convex-ridge opposed-column skip (I0.1 cow ears, 2026-06-13) ---
+        // Two adjacent split columns sharing a sharp CONVEX wall edge end up
+        // with rails that diverge over the bend; their seg0 strips meet as
+        // strips:opposed and come out wrong-oriented/highly-skew. Demote BOTH
+        // (the test is symmetric) to a tracked skip instead of building the bad
+        // strip. Real fix = shared-rail consensus on convex ridges (I1.1/I1.3).
+        {
+            const label patchi   = patches.findPatchID(specs[col.si].patchName);
+            const label wf       = col.meshFacei;                 // wall face
+            const vector na      = mesh.faceAreas()[wf];
+            const vector nahat   = na/(mag(na) + VSMALL);          // outward of domain
+            const point  Ca      = mesh.faceCentres()[wf];
+            const scalar cosConvex = Foam::cos(degToRad(convexAngle));
+            bool convexRidge = false;
+            for (const label ei : mesh.faceEdges()[wf])
+            {
+                for (const label nb : mesh.edgeFaces()[ei])
+                {
+                    if (nb == wf || mesh.isInternalFace(nb))   continue;
+                    if (patches.whichPatch(nb) != patchi)      continue;
+                    const vector nbA   = mesh.faceAreas()[nb];
+                    const vector nbhat = nbA/(mag(nbA) + VSMALL);
+                    if ((nahat & nbhat) >= cosConvex)         continue;  // not sharp enough
+                    const point  Cb    = mesh.faceCentres()[nb];
+                    if ((nahat & (Cb - Ca)) <= 0)             continue;  // concave -> not ours
+                    const label nbCell = mesh.faceOwner()[nb];
+                    if (claimed[nbCell] >= 0 && claimed[nbCell] != ci)
+                    {
+                        convexRidge = true; break;            // adjacent claimed column on a convex ridge
+                    }
+                }
+                if (convexRidge) break;
+            }
+            if (convexRidge)
+            {
+                col.skip = true; col.reason = "convexRidge";
+                ++nConvex[col.si];
+                continue;
+            }
+        }
+
         const label m = col.chain.size();
 
         // (a) shared-rail consistency: chain length, scale AND the ring->
@@ -673,6 +720,7 @@ int main(int argc, char *argv[])
                 << "|skippedConflict|" << nConflict[si]
                 << "|skippedWarp|" << nWarp[si]
                 << "|skippedCross|" << nCross[si]
+                << "|skippedConvexRidge|" << nConvex[si]
                 << nl;
         }
     }
