@@ -445,6 +445,69 @@ int main(int argc, char *argv[])
     {
         return edge(cl.rails[c][0], cl.rails[c][1]);
     };
+
+    // ---- S1: min-scale consensus (I1.1) ---------------------------------
+    // Columns that share a GENUINE rail (same first edge AND identical full
+    // joint path) but carry different per-column scales — because their OTHER
+    // rails differ in length — trip the scale arm of the conflict check, so the
+    // later column is skipped (the "scaleOnly" conflicts; S0: bracket 31,
+    // manifold 221k). Union such columns and give the component ONE scale (its
+    // MIN, so no column claims more height than it can reach); the existing
+    // first-come conflict check then passes (equal scale -> equal assign) and
+    // the layers are kept. Strictly conflict-reducing (joints/nSeg untouched).
+    {
+        labelList parent(columns.size());
+        forAll(parent, i) { parent[i] = i; }
+        auto root = [&](label a) -> label   // iterative find + path-halving
+        {
+            while (parent[a] != a) { parent[a] = parent[parent[a]]; a = parent[a]; }
+            return a;
+        };
+        auto unite = [&](label a, label b)
+        {
+            const label ra = root(a), rb = root(b);
+            if (ra != rb) { parent[max(ra, rb)] = min(ra, rb); }
+        };
+        // group rail instances by first-edge key; within a bucket, columns whose
+        // rail has the IDENTICAL joint path share a genuine rail -> union them.
+        EdgeMap<DynamicList<label>> byKey;     // key -> packed (ci*4 + railIndex)
+        forAll(columns, ci)
+        {
+            if (columns[ci].skip || forcedSkip.found(ci)) { continue; }
+            forAll(columns[ci].rails, c)
+            {
+                DynamicList<label>& bucket = byKey(railKey(columns[ci], c));
+                for (const label packed : bucket)
+                {
+                    if (columns[packed/4].rails[packed%4] == columns[ci].rails[c])
+                    {
+                        unite(ci, packed/4);
+                    }
+                }
+                bucket.append(ci*4 + c);
+            }
+        }
+        Map<scalar> compMin;
+        forAll(columns, ci)
+        {
+            if (columns[ci].skip || forcedSkip.found(ci)) { continue; }
+            const label r = root(ci);
+            if (!compMin.found(r) || columns[ci].scale < compMin[r])
+            {
+                compMin.set(r, columns[ci].scale);
+            }
+        }
+        label nLowered = 0;
+        forAll(columns, ci)
+        {
+            if (columns[ci].skip || forcedSkip.found(ci)) { continue; }
+            const scalar s = compMin[root(ci)];
+            if (s < columns[ci].scale - SMALL) { ++nLowered; }
+            columns[ci].scale = s;
+        }
+        Info<< "SPLITLAYERS|consensus|scaleLowered|" << nLowered << nl;
+    }
+
     List<label> nConflict(specs.size(), 0), nWarp(specs.size(), 0),
                 nCross(specs.size(), 0);
     List<label> nConvex(specs.size(), 0);        // skippedConvexRidge (I0.1)
