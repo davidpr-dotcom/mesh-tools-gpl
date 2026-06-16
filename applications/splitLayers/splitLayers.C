@@ -511,6 +511,11 @@ int main(int argc, char *argv[])
     List<label> nConflict(specs.size(), 0), nWarp(specs.size(), 0),
                 nCross(specs.size(), 0);
     List<label> nConvex(specs.size(), 0);        // skippedConvexRidge (I0.1)
+    // S2 diagnostic (I1.1, behaviour-neutral): for joints-arm conflicts (corner
+    // bisectors), histogram the shared-prefix depth (how many leading rail points
+    // the two diverging rails share). Depth ~2 = share only seg0 → per-segment
+    // consensus recovers; deeper = true corner → I1.3. Decides the S2b approach.
+    Map<label> jointsPrefixHist;
 
     // rail assignment for a column's rail c under the column's scale
     auto computeAssign = [&](const Column& col, const label c) -> labelList
@@ -602,22 +607,34 @@ int main(int argc, char *argv[])
         // a neighbour's table while their own rails used their own).
         const labelList a0 = computeAssign(col, 0);
         bool conflict = false;
+        label jointsPrefix = -1;   // S2 diag: shallowest shared-prefix on a joints-mismatch rail
         forAll(col.rails, c)
         {
             const auto it = railsOf.cfind(railKey(col, c));
-            if (it.good()
-             && (it.val().nSeg != m
-              || mag(it.val().scale - col.scale) > 1e-6 * col.scale + VSMALL
-              || it.val().assign != a0
-              || it.val().joints != col.rails[c]))   // FULL-PATH identity
+            if (!it.good()) { continue; }
+            const bool jb = (it.val().joints != col.rails[c]);   // FULL-PATH identity
+            if (it.val().nSeg != m
+             || mag(it.val().scale - col.scale) > 1e-6 * col.scale + VSMALL
+             || it.val().assign != a0
+             || jb)
             {
                 conflict = true;
+            }
+            if (jb)   // common leading points before the two rails diverge
+            {
+                const labelList& A = it.val().joints;
+                const labelList& B = col.rails[c];
+                const label n = min(A.size(), B.size());
+                label p = 0;
+                while (p < n && A[p] == B[p]) { ++p; }
+                if (jointsPrefix < 0 || p < jointsPrefix) { jointsPrefix = p; }
             }
         }
         if (conflict)
         {
             col.skip = true; col.reason = "conflict";
             ++nConflict[col.si];
+            if (jointsPrefix >= 0) { jointsPrefixHist(jointsPrefix) += 1; }  // S2 diag
             continue;
         }
 
@@ -813,6 +830,13 @@ int main(int argc, char *argv[])
                 << "|skippedConvexRidge|" << nConvex[si]
                 << nl;
         }
+        // S2 diagnostic: shared-prefix-depth histogram of the joints conflicts.
+        Info<< "SPLITLAYERS|jointsConflict|prefixHistogram";
+        forAllConstIters(jointsPrefixHist, it)
+        {
+            Info<< "|" << it.key() << ":" << it.val();
+        }
+        Info<< nl;
     }
 
     if (dryRun)
