@@ -101,6 +101,70 @@ consult) is finalized **after** the diagnostic confirms the prefix-depth structu
 - Each stage gated on the **bracket_corner** fixture + checkMesh-clean; the
   orchestrator demotes any recovered column that turns skew (S1's manifold lesson).
 
+## S2b implementation architecture (detailed, 2026-06-16)
+
+**Key code finding that makes this tractable:** the **topology already consumes
+rings per segment edge** — PASS 4's `withForeignRings` and the lateral pass walk
+`segRings` (`EdgeMap<labelList>`, keyed by segment edge). The whole-rail constraint
+lives only in two places: (b1) the PASS-2 conflict check (whole-rail identity), and
+(b2) PASS-3 ring *creation* (`rd.rings` per `railKey`, one rail per first edge, in
+`railsOf`). So we do NOT rewrite the topology; we change creation + the check.
+
+**The model:** rings are identified **per segment edge**; a column's rail is a
+sequence of segments and its `rd.rings[k]` reference whichever point sits on the
+segment that layer k falls in. Two rails sharing a prefix share those segments'
+ring **point labels** (not duplicates) — so the mesh is consistent — and each
+builds its own divergent-suffix segments.
+
+**Changes, pass by pass:**
+
+1. **Scale (extend S1).** Today S1 unites only *identical-full-path* rails. Extend
+   the union to rails that **share the first edge** (`railKey`) so prefix-sharers
+   get one component scale (MIN). Shared-prefix segments then have identical arc +
+   scale → identical layer positions → the shared ring points coincide and can be
+   reused. (Components stay local — a corner point's ~4 columns — not a global
+   cascade.)
+
+2. **PASS 3 — per-segment ring creation (the core change).** Introduce a segment
+   registry `EdgeMap<labelList> ringPtsOf` (segment edge → ordered ring labels,
+   wall-side→interior; both rails traverse a segment the same way since rails grow
+   outward). Per column, per rail: walk segments accumulating arc; group layers k
+   (at `h_k = scale·cumHeights[k]`) by the segment they fall in; for each segment
+   edge — **reuse** its labels from `ringPtsOf` if present, **else create** the
+   points + register. Assemble the column's own `rd.rings[c]` (now **per-column**,
+   not per-railKey). Register `segRings` exactly as today (topology unchanged).
+
+3. **Validity guard (robustness — never silently wrong).** Before reusing a
+   segment's labels, verify the reusing rail agrees on that segment: same scale,
+   same cumulative-arc-to-segment, same layer set. The diagnostic says all sharing
+   is *prefix* sharing (same arc) so this always holds for the bracket; the guard
+   makes it robust to any future non-prefix sharing — on mismatch, **fall back to
+   the strict skip** (coverage-only, never a bad mesh).
+
+4. **PASS 2 — relax the conflict check.** Replace whole-rail `joints/assign`
+   identity with: a column is compatible if, on every segment it *shares* with an
+   already-created rail, the guard (3) passes; divergence after the shared prefix
+   is allowed. Genuinely-irreconcilable → strict skip (fallback). nSeg is no longer
+   a blocker (divergent rails legitimately differ in length).
+
+5. **PASS 4 — unchanged.** It already reads `segRings` (per segment) for side
+   faces and the per-column stack for cells; per-column `rd.rings` feeds the layer
+   interfaces as before. Audit that nothing reads `railsOf[key].rings` assuming
+   one-rail-per-key (the optimize pass `forAllConstIters(railsOf,…)` must iterate
+   the new per-column store instead).
+
+**Why this is the most-robust long-term choice (not a patch):** it removes the
+incorrect whole-rail identity assumption at its root (rings belong to segments),
+makes prefix-sharing fall out automatically with no special-casing, keeps the
+strict skip as a coverage-only safety net, and leaves the topology untouched. It
+generalizes S1 (whole-rail scale consensus → per-segment ring consensus) rather
+than bolting on a corner special case.
+
+**Staging:** the per-segment model handles all prefix depths uniformly, so it's one
+coherent change rather than depth-2-then-depth-4. Build it behind the strict-skip
+fallback so each WSL iteration is safe; gate on bracket_corner + the orchestrator.
+True multi-face corners (if any surface) and warp remain I1.3 / I1.4.
+
 ## DoD
 
 bracket `skippedConflict` materially down from 202 (target the joints share the

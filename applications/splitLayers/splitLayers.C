@@ -981,6 +981,155 @@ int main(int argc, char *argv[])
         Info<< "SPLITLAYERS|lateSkips|edgeConflict|" << nEdgeConflict << nl;
     }
 
+    // S2b — recovery store for prefix-divergent (corner-bisector) sharers,
+    // populated by the recovery pass. EMPTY here, so the accessors below fall
+    // through to the canonical railsOf and behaviour is byte-identical to today;
+    // the recovery increment fills these with a sharer's OWN rail rings (reused
+    // canonical prefix + own divergent suffix) and assign table.
+    Map<FixedList<labelList, 4>> sharerRings;   // ci -> 4 rails' recovered rings
+    Map<labelList> sharerAssign;                // ci -> recovered assign
+
+    // ---- S2b: recover prefix-divergent (corner-bisector) sharers ----------
+    // A column skipped as "conflict" because a rail shares a canonical's first
+    // edge then DIVERGES (S2 diagnostic: every bracket/cow joints conflict is a
+    // shared prefix). Rebuild it: adopt the (min) canonical scale; on each rail
+    // REUSE the canonical's shared-prefix ring LABELS (so the shared edges stay
+    // single-valued) and create OWN points on the divergent suffix. Every step
+    // is guarded — scale must match to reuse, the column must be warp-free, and
+    // a suffix segment claimed by another base aborts the recovery — so anything
+    // that cannot recover cleanly STAYS SKIPPED (coverage-only fallback). The
+    // canonical creation path above is UNTOUCHED.
+    {
+        label nRecovered = 0;
+        forAll(columns, ci)
+        {
+            Column& col = columns[ci];
+            if (!col.skip || col.reason == nullptr) { continue; }
+            if (std::string(col.reason) != "conflict") { continue; }
+
+            // adopt the MIN canonical scale over this column's colliding rails
+            scalar s = col.scale;
+            bool anyCanon = false;
+            forAll(col.rails, c)
+            {
+                const auto it = railsOf.cfind(railKey(col, c));
+                if (it.good() && it.val().rings.size())
+                {
+                    s = min(s, it.val().scale);
+                    anyCanon = true;
+                }
+            }
+            if (!anyCanon) { continue; }
+            const scalar saved = col.scale;
+            col.scale = s;                          // assign/heights now consistent at s
+
+            // warp guard: all four rails must agree on ring->segment assignment
+            const labelList a0 = computeAssign(col, 0);
+            bool ok = true;
+            for (label c = 1; c < 4 && ok; ++c)
+            {
+                if (computeAssign(col, c) != a0) { ok = false; }
+            }
+
+            const label nL = specs[col.si].nLayers;
+            FixedList<labelList, 4> myRings;        // final per-layer ring labels
+            FixedList<List<point>, 4> createPos;    // planned positions for to-create slots
+
+            // PLAN (no mesh side effects): source each rail's rings PER SEGMENT
+            // from segRings — the SAME registry the lateral faces read. Reuse a
+            // segment's registered labels if present (so ring faces and lateral
+            // faces can never disagree on a shared edge); else plan a creation.
+            // Any guard failure aborts the WHOLE recovery before a single point is
+            // added, so an aborted recovery leaves zero orphaned points.
+            forAll(col.rails, c)
+            {
+                if (!ok) { break; }
+                const labelList& r = col.rails[c];
+                myRings[c].setSize(nL, -1);
+                createPos[c].setSize(nL, point(Zero));
+                scalarList arc(r.size(), Zero);
+                for (label j = 1; j < r.size(); ++j)
+                {
+                    arc[j] = arc[j-1] + mag(pts[r[j]] - pts[r[j-1]]);
+                }
+                for (label j = 0; j + 1 < r.size() && ok; ++j)
+                {
+                    // layers (in k order) that fall on this segment
+                    DynamicList<label> ks;
+                    forAll(a0, k) { if (a0[k] == j) { ks.append(k); } }
+                    if (ks.empty()) { continue; }
+                    const edge se(r[j], r[j+1]);
+                    const auto sr = segRings.cfind(se);
+                    if (sr.good())
+                    {
+                        // REUSE the registered labels — only if the layer set
+                        // matches (same scale+arc => same count); a mismatch is
+                        // irreconcilable -> fall back to the strict skip.
+                        if (sr.val().size() != ks.size()) { ok = false; break; }
+                        forAll(ks, i) { myRings[c][ks[i]] = sr.val()[i]; }
+                    }
+                    else
+                    {
+                        // CREATE: the edge must be free or already this base's.
+                        const auto ec = edgeClaim.cfind(se);
+                        if (ec.good() && ec.val() != r[0]) { ok = false; break; }
+                        forAll(ks, i)
+                        {
+                            const label k = ks[i];
+                            const scalar h = s * cumHeights[col.si][k];
+                            const scalar f =
+                                (h - arc[j]) / max(arc[j+1] - arc[j], VSMALL);
+                            createPos[c][k] =
+                                pts[r[j]] + f*(pts[r[j+1]] - pts[r[j]]);
+                            // myRings[c][k] stays -1 -> filled at commit
+                        }
+                    }
+                }
+            }
+            if (!ok)
+            {
+                col.scale = saved;                  // revert; stay skipped (fallback)
+                continue;
+            }
+
+            // COMMIT (the only mesh side effects, now every guard has passed):
+            // create the planned points, then register + claim each CREATED
+            // segment so segRings (lateral faces) and myRings (ring faces) carry
+            // identical labels on every edge of this column.
+            forAll(col.rails, c)
+            {
+                const labelList& r = col.rails[c];
+                forAll(myRings[c], k)
+                {
+                    if (myRings[c][k] == -1)
+                    {
+                        const point& rp = createPos[c][k];
+                        myRings[c][k] = meshMod.addPoint(rp, r[0], -1, true);
+                        newPtPos.insert(myRings[c][k], rp);
+                    }
+                }
+                for (label j = 0; j + 1 < r.size(); ++j)
+                {
+                    const edge se(r[j], r[j+1]);
+                    if (segRings.found(se)) { continue; }   // reused — keep labels
+                    DynamicList<label> inSeg;
+                    forAll(a0, k) { if (a0[k] == j) { inSeg.append(myRings[c][k]); } }
+                    if (inSeg.size())
+                    {
+                        segRings.insert(se, labelList(inSeg));
+                        edgeClaim.insert(se, -1);
+                    }
+                }
+            }
+            sharerRings.insert(ci, myRings);
+            sharerAssign.insert(ci, a0);
+            col.skip = false;
+            col.reason = nullptr;
+            ++nRecovered;
+        }
+        Info<< "SPLITLAYERS|recovered|" << nRecovered << nl;
+    }
+
     // ---- PASS 4: topology -------------------------------------------------
     Map<labelList> stackOf;     // column id -> n+1 new cell labels
     Map<label> cellCol;         // chain cell -> column id
@@ -1075,6 +1224,21 @@ int main(int argc, char *argv[])
         }
     };
 
+    // S2b ring/assign access — a column's OWN rail data: a recovered sharer's
+    // reused-prefix+own-suffix rings (sharerRings/sharerAssign), else the
+    // canonical railsOf. With the store empty this is exactly railsOf (identity).
+    auto ringsFor = [&](const label ci2, const Column& cl, const label c)
+        -> const labelList&
+    {
+        const auto sit = sharerRings.cfind(ci2);
+        return sit.good() ? sit.val()[c] : railsOf[railKey(cl, c)].rings;
+    };
+    auto assignFor = [&](const label ci2, const Column& cl) -> const labelList&
+    {
+        const auto sit = sharerAssign.cfind(ci2);
+        return sit.good() ? sit.val() : railsOf[railKey(cl, 0)].assign;
+    };
+
     forAll(columns, ci)
     {
         const Column& col = columns[ci];
@@ -1082,7 +1246,7 @@ int main(int argc, char *argv[])
         const label n = specs[col.si].nLayers;
         const label patchi = patches.findPatchID(specs[col.si].patchName);
         const labelList& stack = stackOf[ci];
-        const labelList& assign = railsOf[railKey(col, 0)].assign;
+        const labelList& assign = assignFor(ci, col);
 
         // rings-before-segment table
         labelList ringsBefore(col.chain.size() + 1, 0);
@@ -1109,7 +1273,7 @@ int main(int argc, char *argv[])
             face rf(4);
             forAll(wf, c)
             {
-                rf[c] = railsOf[railKey(col, 3 - c)].rings[k];
+                rf[c] = ringsFor(ci, col, 3 - c)[k];
             }
             saneCheck(rf, col.meshFacei, ci, "ring");
             meshMod.addFace(rf, stack[k], stack[k + 1],
@@ -1225,7 +1389,7 @@ int main(int argc, char *argv[])
                         {
                             return col.rails[c][i + 1];
                         }
-                        return railsOf[railKey(col, c)].rings[cutK[idx]];
+                        return ringsFor(ci, col, c)[cutK[idx]];
                     };
 
                     face sf(f.size());
@@ -1255,8 +1419,7 @@ int main(int argc, char *argv[])
                     {
                         const labelList& oStack = stackOf[cellCol[other]];
                         const labelList& oAssign =
-                            railsOf[railKey(columns[cellCol[other]], 0)]
-                                .assign;
+                            assignFor(cellCol[other], columns[cellCol[other]]);
                         label oBefore = 0;
                         forAll(oAssign, k)
                         {
@@ -1269,8 +1432,7 @@ int main(int argc, char *argv[])
                     {
                         const labelList& oStack = stackOf[cellCol[other]];
                         const labelList& oAssign =
-                            railsOf[railKey(columns[cellCol[other]], 0)]
-                                .assign;
+                            assignFor(cellCol[other], columns[cellCol[other]]);
                         label oBefore = 0;
                         forAll(oAssign, k)
                         {
