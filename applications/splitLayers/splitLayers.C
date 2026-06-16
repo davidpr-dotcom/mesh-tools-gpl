@@ -201,6 +201,9 @@ int main(int argc, char *argv[])
     argList::addBoolOption("dryRun", "identify and report columns only");
     argList::addBoolOption("debugDump",
         "write constant/splitLayersDebugMap: finalFace origFace tag column");
+    argList::addOption("skipColumns", "file",
+        "force-skip these column ids (newline list); the meshcore quality-retry "
+        "orchestrator passes the columns whose built faces failed checkMesh");
     #include "setRootCase.H"
     #include "createTime.H"
 
@@ -228,6 +231,21 @@ int main(int argc, char *argv[])
     const scalar convexAngle = args.getOrDefault<scalar>("convexRidgeAngle", 70.0);
     const bool dryRun = args.found("dryRun");
     const bool debugDump = args.found("debugDump");
+
+    // Columns the meshcore quality-retry orchestrator demoted on a prior round
+    // (their built faces failed checkMesh). Mesh-quality-driven, not a geometric
+    // guess. Column ids are stable across runs (assigned in PASS 1, before skip).
+    labelHashSet forcedSkip;
+    {
+        fileName scf;
+        if (args.readIfPresent("skipColumns", scf))
+        {
+            std::ifstream scs(scf.c_str());
+            label c;
+            while (scs >> c) { forcedSkip.insert(c); }
+            Info<< "SPLITLAYERS|skipColumns|count|" << forcedSkip.size() << nl;
+        }
+    }
 
     // forensics: original-face -> (construct tag, column id)
     Map<word> faceTagOf;
@@ -460,6 +478,15 @@ int main(int argc, char *argv[])
     {
         Column& col = columns[ci];
         if (col.skip) { continue; }
+
+        // forced skip from the meshcore quality-retry orchestrator: this column's
+        // built faces failed checkMesh on a prior round (mesh-quality-driven, not
+        // a geometric guess). Demote it; its neighbours may recover.
+        if (forcedSkip.found(ci))
+        {
+            col.skip = true; col.reason = "forcedSkip";
+            continue;
+        }
 
         // --- convex-ridge opposed-column skip (I0.1 cow ears, 2026-06-13) ---
         // Two adjacent split columns sharing a sharp CONVEX wall edge end up
