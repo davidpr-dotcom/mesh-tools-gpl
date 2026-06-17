@@ -296,3 +296,40 @@ then `2026-06-16-splitlayers-quality-retry.py manifold_gap` (with a `-gapCap`
 passthrough) converges by demoting the residual. A clean *build* of those 40
 transition faces (no demote) is a future refinement; the manifold ships on extrusion
 meanwhile, so this is not on the external-aero MVP path.
+
+---
+
+## CLOSE-OUT (2026-06-17): root cause corrected + dispatch detector proven
+
+Two corrections to the record, both forced by measurement (the discipline working):
+
+1. **Open cells are NOT cramming.** Capping (`-gapCap`) fixed the cramming (scale→1)
+   but moved open cells only 17790→16284 (~8%). So the layer-budget premise of the
+   `2026-06-17-internal-flow-gap-aware-layers` doc does not explain the open cells.
+
+2. **NOT a cartesian staircase either** (an interim hypothesis I stated too strongly).
+   The base-mesh staircase fraction (wall cells whose INWARD neighbour is itself a
+   wall cell) measured **0.013 on the manifold — same as the externals.** Combined
+   with: true gap **4 mm** (measured face-to-face; the BL stack 1.6 mm fits), 1:1
+   wall-face:cell, 95% multiRow, `blockCol ≥ 0` for 92% — the real mechanism is
+   **enclosed-interior rail-claim contention**: on an enclosed/concave internal
+   geometry every wall's inward rails compete FIRST-COME for the shared interior
+   cells, so most columns block after 1–3 cells (`avail ~0.13mm`, scale 0.06–0.21).
+   Extrusion avoids it by inflating off the patch (proven: snappy addLayers = 91%
+   coverage, checkMesh-clean, same geometry/spec).
+
+**Proven existence + non-fix results:** extrusion is clean (geometry IS layerable);
+a split-side claiming fix is ruled out (no free interior to negotiate); refinement is
+ruled out (the gap already has ~30 cells across; finer cells shrink `avail`). So the
+manifold is an **extrusion case**, not a split case — confirming the dual-executor gate.
+
+**Dispatch detector (built + proven, `Zefra/meshcore/executors/dispatch.py`).** The
+discriminator is NOT geometry — it is whether split's rails grow, measured by
+`splitLayers -dryRun` (no construction): `meanScale` / `gapDanger`. Decision:
+`meanScale < 0.5` OR `dangerFraction > 0.5` → extrusion; else split. Plus a base-mesh
+`staircase_fraction` advisory cross-check (it ruled out the staircase story above).
+End-to-end on all four (2026-06-17): ahmed 0.85/0.00→SPLIT, bracket 0.98/0.03→SPLIT,
+cow 0.72/0.00→SPLIT, manifold 0.21/0.92→EXTRUSION. 11 unit tests green. Driver:
+`Zefra/tools/2026-06-17-dispatch-probe.py`. `sizing.layers.classify_dispatch`
+(the old gap_min proxy) is marked superseded; wire `probe_split_viability` into the
+volume pipeline (post-mesh, pre-layer) to make it authoritative.
