@@ -166,6 +166,8 @@ struct Column
     label topFace = -1;         // opposing face of the last cell
     FixedList<labelList, 4> rails;   // point paths, size m+1 each
     scalar scale = 1.0;
+    label nCol = -1;            // I-INT: this column's layer count (gap-capped;
+                                // == spec nLayers externally, fewer in a thin gap)
     bool skip = false;
     const char* reason = nullptr;
 };
@@ -196,14 +198,23 @@ int main(int argc, char *argv[])
     argList::addOption("featureAngle", "deg",
                        "feature-point detection angle (default 45)");
     argList::addOption("convexRidgeAngle", "deg",
-                       "convex-ridge skip threshold, I0.1 (default 70; sharper "
-                       "= fewer skips; only edges this convex are demoted)");
+                       "convex-ridge geometric skip threshold, I0.1 (default 179: "
+                       "the RIDGE heuristic is retired — ridges build and the "
+                       "quality-retry orchestrator demotes any that fail — but "
+                       "near-anti-parallel opposing walls are still skipped to mask "
+                       "the opposing-wall construction bug. 180=fully off (exposes "
+                       "that crash); a sharper angle re-enables the ridge skip)");
     argList::addBoolOption("dryRun", "identify and report columns only");
     argList::addBoolOption("debugDump",
         "write constant/splitLayersDebugMap: finalFace origFace tag column");
     argList::addOption("skipColumns", "file",
         "force-skip these column ids (newline list); the meshcore quality-retry "
         "orchestrator passes the columns whose built faces failed checkMesh");
+    argList::addBoolOption("gapCap",
+        "internal-flow gap budgeting (task 19): cap a column's layer COUNT when its "
+        "full stack cannot fit the available inward depth — the oblique/curved thin "
+        "gaps the anti-parallel test misses. The planner sets this ONLY for internal "
+        "geometries, so external aero is byte-identical (flag off => unchanged).");
     #include "setRootCase.H"
     #include "createTime.H"
 
@@ -228,9 +239,10 @@ int main(int argc, char *argv[])
     const word placement = args.getOrDefault<word>("placement", "normal");
     const label nOptSweeps = args.getOrDefault<label>("optimizeSweeps", 10);
     const scalar featAngle = args.getOrDefault<scalar>("featureAngle", 45.0);
-    const scalar convexAngle = args.getOrDefault<scalar>("convexRidgeAngle", 70.0);
+    const scalar convexAngle = args.getOrDefault<scalar>("convexRidgeAngle", 179.0);
     const bool dryRun = args.found("dryRun");
     const bool debugDump = args.found("debugDump");
+    const bool gapCap = args.found("gapCap");   // task 19: internal-flow gap budgeting
 
     // Columns the meshcore quality-retry orchestrator demoted on a prior round
     // (their built faces failed checkMesh). Mesh-quality-driven, not a geometric
@@ -250,6 +262,10 @@ int main(int argc, char *argv[])
     // forensics: original-face -> (construct tag, column id)
     Map<word> faceTagOf;
     Map<label> faceColOf;
+    // task 19 (opposing-wall gap collision): for a strip side face, the OTHER
+    // column claiming the cell across the face (claimed[oth]). Lets the OPENCELL
+    // attributor name BOTH facing-wall columns and dump their seg0 ring geometry.
+    Map<label> faceOtherColOf;
     auto recordFace = [&](const label origFace, const char* tag,
                           const label ci2)
     {
@@ -338,6 +354,23 @@ int main(int argc, char *argv[])
     DynamicList<Column> columns;
     labelList claimed(mesh.nCells(), -1);
     List<label> nCorner(specs.size(), 0), nNonHex(specs.size(), 0);
+    // I-INT G1 (emit-only, NO behaviour change): the gap budget. How many spec
+    // layers fit the available rail depth at FULL size (cumHeights[k] <=
+    // minRailLen)? The rail stops where it runs out of room — the opposing wall,
+    // or the gap centre where the opposing column's claim blocks it — so
+    // minRailLen IS the available depth: ~half-gap internally, ~needed externally.
+    // External columns fit all layers; thin-gap columns fit fewer. This proves the
+    // internal/external discriminator before any topology change (G2).
+    const scalar gapMargin = 0.7;   // thin-gap: layers fill <= 70% of avail depth,
+                                    // leaving a healthy remainder + meeting buffer
+    List<label> gapCapped(specs.size(), 0);          // cols with nCol < nLayers
+    List<label> gapSkip(specs.size(), 0);            // cols skipped (gap < 1 layer)
+    List<label> gapTot(specs.size(), 0);             // total built cols
+    List<label> gapMinFit(specs.size(), labelMax);   // min nCol over cols
+    // task 19 confirmatory (emit-only): count + sample columns that keep FULL
+    // layers while crammed into a thin space (scale<0.5) — the open-cell danger
+    // zone — and dump their gap-discriminator decision.
+    label gapDanger = 0;
 
     forAll(specs, si)
     {
@@ -398,17 +431,29 @@ int main(int argc, char *argv[])
                 return L;
             };
 
+            label blockCol = -1;    // I-INT G3: column whose claim stopped the rail
+            label blockFace = -1;   // or the opposing-patch wall face it reached
             while (minRailLen() < needed[si] && mesh.isInternalFace(iface))
             {
                 const label cOwn = mesh.faceOwner()[iface];
                 const label cNei = mesh.faceNeighbour()[iface];
                 const label next = (cOwn == col.chain.last()) ? cNei : cOwn;
                 if (next < 0) { break; }
-                if (claimed[next] >= 0 || patchFaceCount[next] > 0
-                 || !isHex(next))
+                if (claimed[next] >= 0) { blockCol = claimed[next]; break; }
+                if (patchFaceCount[next] > 0)
                 {
+                    // rail reached a boundary cell — capture its face on THIS
+                    // layered patch (the opposing wall of a thin gap).
+                    forAll(cells[next], fj)
+                    {
+                        const label bf = cells[next][fj];
+                        if (!mesh.isInternalFace(bf)
+                         && patches.whichPatch(bf) == pp.index())
+                        { blockFace = bf; break; }
+                    }
                     break;
                 }
+                if (!isHex(next)) { break; }
                 const label nextIface =
                     cells[next].opposingFaceLabel(iface, faces);
                 if (nextIface < 0 || faces[nextIface].size() != 4) { break; }
@@ -430,9 +475,189 @@ int main(int argc, char *argv[])
                 iface = nextIface;
             }
             col.topFace = iface;
-            col.scale = min(scalar(1), minRailLen() / needed[si]);
+            // I-INT G2: gap-aware layer count. minRailLen is the available depth.
+            // If ALL spec layers fit at full size -> external, keep the exact old
+            // scale (byte-identical). Else (thin gap) -> as many FULL-size layers
+            // as fit within gapMargin·avail (full y1 preserved, healthy remainder);
+            // 0 -> skip (gap too thin for even one layer, cleaner than degenerate).
+            {
+                const scalar avail = minRailLen();
+                // I-INT G3: cap ONLY at a TRUE gap — an ANTI-PARALLEL opposing
+                // wall (rail blocked by the opposing column's claim, or reaching
+                // that wall directly). A reentrant CORNER's blocker is ~perpendic-
+                // ular (dot ~0) so it is NOT capped -> corners/externals stay
+                // byte-identical. -0.5 = walls facing within 60° of head-on.
+                vector wn = mesh.faceAreas()[col.meshFacei];
+                wn /= (mag(wn) + VSMALL);
+                label oppFace = -1;
+                if (blockCol >= 0 && blockCol < columns.size())
+                {
+                    oppFace = columns[blockCol].meshFacei;   // opposing col's wall
+                }
+                else if (blockFace >= 0)
+                {
+                    oppFace = blockFace;                     // opposing wall reached
+                }
+                else if (!mesh.isInternalFace(col.topFace)
+                      && patches.whichPatch(col.topFace) == pp.index())
+                {
+                    oppFace = col.topFace;
+                }
+                bool isGap = false;
+                if (oppFace >= 0)
+                {
+                    vector on = mesh.faceAreas()[oppFace];
+                    on /= (mag(on) + VSMALL);
+                    isGap = ((wn & on) < -0.5);
+                }
+
+                // task 19 fix: oblique/curved thin gaps. The anti-parallel test
+                // (wn.on < -0.5) misses gaps whose opposing wall is oblique — the
+                // manifold's are wn.on +0.1..+0.4 (GAPDECIDE, 2026-06-17), so 98.5%
+                // of its columns kept full layers crammed into a sub-mm depth. For
+                // an INTERNAL-flow geometry the planner sets -gapCap; then ANY
+                // column whose full stack cannot fit the available inward depth is
+                // gap-constrained, so it takes the cap branch below (nFit full-size
+                // layers within avail*gapMargin, leaving a healthy remainder) — no
+                // dependence on the opposing-wall angle. External aero never sets
+                // the flag, so it is byte-identical (this block is a no-op there).
+                if (gapCap && cumHeights[si].last() > avail + SMALL)
+                {
+                    isGap = true;
+                }
+
+                if (!isGap || cumHeights[si].last() <= avail + SMALL)
+                {
+                    col.nCol = specs[si].nLayers;
+                    col.scale = min(scalar(1), avail / needed[si]);
+                }
+                else
+                {
+                    label nFit = 0;
+                    forAll(cumHeights[si], k)
+                    {
+                        if (cumHeights[si][k] <= avail*gapMargin) { ++nFit; }
+                    }
+                    col.nCol = nFit;
+                    col.scale = scalar(1);   // full y1; the nFit layers fit by build
+                    if (nFit == 0)
+                    {
+                        col.skip = true; col.reason = "thinGap"; ++gapSkip[si];
+                    }
+                }
+                ++gapTot[si];
+                if (col.nCol < specs[si].nLayers) { ++gapCapped[si]; }
+                gapMinFit[si] = min(gapMinFit[si], col.nCol);
+
+                // task 19 confirmatory (emit-only): a column with FULL layers
+                // crammed into a thin space (scale<0.5) is the open-cell danger
+                // zone. Dump the gap-discriminator decision to see WHY isGap
+                // wasn't set (oppFace missing? wn.on not anti-parallel?) and to
+                // confirm the remainder is ~0 (avail ~= scale*cumLast).
+                if (col.nCol == specs[si].nLayers && col.scale < 0.5)
+                {
+                    ++gapDanger;
+                    if (gapDanger <= 60)
+                    {
+                        scalar won = 2.0;     // sentinel: no oppFace found
+                        label oppPatch = -1;
+                        if (oppFace >= 0)
+                        {
+                            vector onv = mesh.faceAreas()[oppFace];
+                            onv /= (mag(onv) + VSMALL);
+                            won = (wn & onv);
+                            oppPatch = mesh.isInternalFace(oppFace)
+                                     ? -1 : patches.whichPatch(oppFace);
+                        }
+                        Info<< "SPLITLAYERS|GAPDECIDE|col|" << columns.size()
+                            << "|chain|" << col.chain.size()
+                            << "|blockCol|" << blockCol
+                            << "|blockFace|" << blockFace
+                            << "|topInternal|" << mesh.isInternalFace(col.topFace)
+                            << "|oppFace|" << oppFace
+                            << "|oppPatch|" << oppPatch
+                            << "|wn.on|" << won
+                            << "|avail|" << avail
+                            << "|needed|" << needed[si]
+                            << "|cumLast|" << cumHeights[si].last()
+                            << "|isGap|" << isGap
+                            << "|nCol|" << col.nCol
+                            << "|scale|" << col.scale << nl;
+                    }
+                }
+            }
             columns.append(col);
         }
+    }
+
+    forAll(specs, si)
+    {
+        Info<< "SPLITLAYERS|gap|" << specs[si].patchName
+            << "|cappedCols|" << gapCapped[si]
+            << "|skippedThinGap|" << gapSkip[si]
+            << "|totalCols|" << gapTot[si]
+            << "|minFit|" << (gapTot[si] ? gapMinFit[si] : specs[si].nLayers)
+            << "|nLayers|" << specs[si].nLayers << nl;
+    }
+    Info<< "SPLITLAYERS|gapDangerTotal|" << gapDanger << nl;
+
+    // ---- task 19: gradual layer-count termination (gapCap only) ----------
+    // The count cap leaves abrupt nCol jumps (e.g. 8 next to 2) where a column
+    // that fit its full stack abuts a pinched neighbour. The variable-n strip/
+    // lateral topology only closes GENTLE steps (the `term` clamp handles +-1),
+    // so big jumps dangle (BADFACE|lateral, ownN/neiN = 8/2, 2026-06-17). Smooth
+    // the count field so edge-adjacent SPLIT columns differ by <= maxNStep: an
+    // 8->2 cliff becomes an 8->..->2 gradient every transition can close.
+    // Monotone-decreasing => terminates; the fixpoint is order-independent
+    // (min-plus relaxation). Split-vs-skip (nCol 0) transitions are left alone
+    // (the lateral pass handles them; they do not dangle). External aero never
+    // sets -gapCap => this whole block is a no-op there (byte-identical).
+    if (gapCap)
+    {
+        const label maxNStep = 1;
+        label nLowered = 0, totSweeps = 0;
+        forAll(specs, si)
+        {
+            const polyPatch& pp =
+                patches[patches.findPatchID(specs[si].patchName)];
+            labelList colOf(pp.size(), -1);             // patch face -> column id
+            forAll(columns, ci)
+            {
+                const Column& c = columns[ci];
+                if (c.si == si && !c.skip && c.nCol > 0)
+                {
+                    colOf[c.patchFacei] = ci;
+                }
+            }
+            const labelListList& ff = pp.faceFaces();   // edge-connected patch faces
+            bool changed = true;
+            label sweeps = 0;
+            while (changed && sweeps < 1000)
+            {
+                changed = false;
+                ++sweeps;
+                forAll(colOf, pfi)
+                {
+                    const label ci = colOf[pfi];
+                    if (ci < 0) { continue; }
+                    label lo = labelMax;
+                    forAll(ff[pfi], k)
+                    {
+                        const label nci = colOf[ff[pfi][k]];
+                        if (nci >= 0) { lo = min(lo, columns[nci].nCol); }
+                    }
+                    if (lo != labelMax && columns[ci].nCol > lo + maxNStep)
+                    {
+                        columns[ci].nCol = lo + maxNStep;
+                        ++nLowered;
+                        changed = true;
+                    }
+                }
+            }
+            totSweeps += sweeps;
+        }
+        Info<< "SPLITLAYERS|gapSmooth|maxStep|" << maxNStep
+            << "|lowered|" << nLowered << "|sweeps|" << totSweeps << nl;
     }
 
     // ---- PASS 2: conflict pre-passes ------------------------------------
@@ -455,6 +680,15 @@ int main(int argc, char *argv[])
     // MIN, so no column claims more height than it can reach); the existing
     // first-come conflict check then passes (equal scale -> equal assign) and
     // the layers are kept. Strictly conflict-reducing (joints/nSeg untouched).
+    //
+    // NOTE (2026-06-16): broadening this union to share-first-edge prefix-sharers
+    // (to lift S2b recovery) was tried and REVERTED — it cascades. A column needs
+    // ONE scale for its 4 rails' ring faces to stay planar, and rails are shared
+    // broadly (even flat structured regions), so harmonizing scale across shared
+    // rails couples the whole connected surface into one component (measured:
+    // bracket nComp 1, meanScale 0.146 — the BL at 14.6% everywhere). Lifting the
+    // remaining corner bisectors is the I1.3 corner-column problem, not a scale
+    // tweak. The consensus|nComp diagnostic below monitors for any such cascade.
     {
         labelList parent(columns.size());
         forAll(parent, i) { parent[i] = i; }
@@ -506,6 +740,28 @@ int main(int argc, char *argv[])
             columns[ci].scale = s;
         }
         Info<< "SPLITLAYERS|consensus|scaleLowered|" << nLowered << nl;
+        // diagnostic (behaviour-neutral): is the union cascading, and how hard is
+        // the resulting compression? maxComp == ~nCols => one giant component (a
+        // cascade); minScale/meanScale say whether that actually thins the BL.
+        {
+            Map<label> compSize;
+            scalar minScale = GREAT, sumScale = 0;
+            label nCols = 0;
+            forAll(columns, ci)
+            {
+                if (columns[ci].skip || forcedSkip.found(ci)) { continue; }
+                ++compSize(root(ci));
+                minScale = min(minScale, columns[ci].scale);
+                sumScale += columns[ci].scale;
+                ++nCols;
+            }
+            label maxComp = 0;
+            forAllConstIters(compSize, it) { maxComp = max(maxComp, it.val()); }
+            Info<< "SPLITLAYERS|consensus|nComp|" << compSize.size()
+                << "|maxComp|" << maxComp
+                << "|minScale|" << minScale
+                << "|meanScale|" << (nCols ? sumScale/nCols : 1.0) << nl;
+        }
     }
 
     List<label> nConflict(specs.size(), 0), nWarp(specs.size(), 0),
@@ -527,8 +783,10 @@ int main(int argc, char *argv[])
             arc[j] = arc[j-1] + mag(pts[r[j]] - pts[r[j-1]]);
         }
         const scalarList& cum = cumHeights[col.si];
-        labelList assign(cum.size());
-        forAll(cum, k)
+        // I-INT: only this column's (gap-capped) layers, not the full spec count
+        const label nc = (col.nCol >= 0) ? col.nCol : cum.size();
+        labelList assign(nc);
+        for (label k = 0; k < nc; ++k)
         {
             const scalar h = col.scale * cum[k];
             label seg = 0;
@@ -557,11 +815,20 @@ int main(int argc, char *argv[])
         }
 
         // --- convex-ridge opposed-column skip (I0.1 cow ears, 2026-06-13) ---
-        // Two adjacent split columns sharing a sharp CONVEX wall edge end up
-        // with rails that diverge over the bend; their seg0 strips meet as
-        // strips:opposed and come out wrong-oriented/highly-skew. Demote BOTH
-        // (the test is symmetric) to a tracked skip instead of building the bad
-        // strip. Real fix = shared-rail consensus on convex ridges (I1.1/I1.3).
+        // Two adjacent split columns sharing a sharp CONVEX wall edge get rails
+        // that diverge over the bend; their seg0 strips meet as strips:opposed
+        // and come out wrong-oriented/highly-skew. As a RIDGE heuristic this is
+        // RETIRED: the default convexRidgeAngle is 179, so genuine ridges (cow
+        // ears, bracket corners) are NO LONGER skipped — they build and the
+        // meshcore quality-retry orchestrator demotes only the columns whose faces
+        // actually fail checkMesh (mesh-quality-driven, not a geometric guess).
+        // At 179 this block STILL fires for near-anti-parallel opposing walls
+        // (e.g. a narrow gap): those columns hit a separate opposing-wall
+        // construction bug (polyTopoChange::getFaceOrder, boundary face w/o patch)
+        // and must be skipped until that bug is fixed (then default -> 180 = fully
+        // off). 180 disables this block entirely; a sharper angle (e.g. 70) brings
+        // back the full ridge heuristic. Real corner fix = I1.3/I1.4 (warp cols).
+        if (convexAngle < 180.0)
         {
             const label patchi   = patches.findPatchID(specs[col.si].patchName);
             const label wf       = col.meshFacei;                 // wall face
@@ -856,6 +1123,49 @@ int main(int argc, char *argv[])
             << "|featurePoints|" << nFeat << nl;
     }
 
+    // ---- I1.3 (I3.1): convex-ridge wall points --------------------------
+    // At a sharp CONVEX wall edge, adjacent columns grow DIVERGENT rails from its
+    // endpoints (different first-interior joints -> different railKeys -> separate
+    // ring sets), so their seg0 strips meet OPPOSED and fail to close (the I0.1
+    // cow-ear / manifold open-cell defect). Mark those endpoints; I3.2 gives them
+    // ONE consensus ring column so the strips coincide. Concave corners are
+    // excluded by the face-centre test (same as the retired convex skip).
+    // (Emit-only here — proves the detector before any construction change.)
+    labelHashSet ridgePts;
+    {
+        const scalar cosRidge = Foam::cos(degToRad(featAngle));
+        forAll(specs, si)
+        {
+            const label patchi = patches.findPatchID(specs[si].patchName);
+            if (patchi < 0) { continue; }
+            const polyPatch& pp = patches[patchi];
+            forAll(pp, pfi)
+            {
+                const label wf = pp.start() + pfi;
+                const vector na = mesh.faceAreas()[wf];
+                const vector nahat = na/(mag(na) + VSMALL);
+                const point Ca = mesh.faceCentres()[wf];
+                for (const label ei : mesh.faceEdges()[wf])
+                {
+                    for (const label nb : mesh.edgeFaces()[ei])
+                    {
+                        if (nb == wf || mesh.isInternalFace(nb)) { continue; }
+                        if (patches.whichPatch(nb) != patchi) { continue; }
+                        const vector nbA = mesh.faceAreas()[nb];
+                        const vector nbhat = nbA/(mag(nbA) + VSMALL);
+                        if ((nahat & nbhat) >= cosRidge) { continue; } // not sharp
+                        const point Cb = mesh.faceCentres()[nb];
+                        if ((nahat & (Cb - Ca)) <= 0) { continue; }    // concave
+                        const edge& e = mesh.edges()[ei];
+                        ridgePts.insert(e[0]);
+                        ridgePts.insert(e[1]);
+                    }
+                }
+            }
+        }
+        Info<< "SPLITLAYERS|ridgePts|" << ridgePts.size() << nl;
+    }
+
     // ---- PASS 3: ring creation ------------------------------------------
     polyTopoChange meshMod(mesh);
     EdgeMap<labelList> segRings;        // segment edge -> ordered ring pts
@@ -938,7 +1248,7 @@ int main(int argc, char *argv[])
                 }
             }
 
-            rd.rings.setSize(specs[col.si].nLayers);
+            rd.rings.setSize(col.nCol);   // I-INT: this column's gap-capped count
             forAll(rd.rings, k)
             {
                 const scalar h = rd.scale * cumHeights[col.si][k];
@@ -1001,6 +1311,10 @@ int main(int argc, char *argv[])
     // canonical creation path above is UNTOUCHED.
     {
         label nRecovered = 0;
+        // S2b abort-reason census (behaviour-neutral): how many conflict columns
+        // abort, and on which guard — sizes whether a scale-harmonization lift is
+        // worth building vs handing the rest to I1.3 corner columns.
+        label nNoCanon = 0, nWarp = 0, nScale = 0, nEdgeClaim = 0;
         forAll(columns, ci)
         {
             Column& col = columns[ci];
@@ -1019,19 +1333,20 @@ int main(int argc, char *argv[])
                     anyCanon = true;
                 }
             }
-            if (!anyCanon) { continue; }
+            if (!anyCanon) { ++nNoCanon; continue; }
             const scalar saved = col.scale;
             col.scale = s;                          // assign/heights now consistent at s
 
             // warp guard: all four rails must agree on ring->segment assignment
             const labelList a0 = computeAssign(col, 0);
             bool ok = true;
+            const char* why = nullptr;
             for (label c = 1; c < 4 && ok; ++c)
             {
-                if (computeAssign(col, c) != a0) { ok = false; }
+                if (computeAssign(col, c) != a0) { ok = false; why = "warp"; }
             }
 
-            const label nL = specs[col.si].nLayers;
+            const label nL = col.nCol;   // I-INT: gap-capped layer count
             FixedList<labelList, 4> myRings;        // final per-layer ring labels
             FixedList<List<point>, 4> createPos;    // planned positions for to-create slots
 
@@ -1065,14 +1380,16 @@ int main(int argc, char *argv[])
                         // REUSE the registered labels — only if the layer set
                         // matches (same scale+arc => same count); a mismatch is
                         // irreconcilable -> fall back to the strict skip.
-                        if (sr.val().size() != ks.size()) { ok = false; break; }
+                        if (sr.val().size() != ks.size())
+                        { ok = false; why = "scale"; break; }
                         forAll(ks, i) { myRings[c][ks[i]] = sr.val()[i]; }
                     }
                     else
                     {
                         // CREATE: the edge must be free or already this base's.
                         const auto ec = edgeClaim.cfind(se);
-                        if (ec.good() && ec.val() != r[0]) { ok = false; break; }
+                        if (ec.good() && ec.val() != r[0])
+                        { ok = false; why = "edgeClaim"; break; }
                         forAll(ks, i)
                         {
                             const label k = ks[i];
@@ -1088,6 +1405,9 @@ int main(int argc, char *argv[])
             }
             if (!ok)
             {
+                if (why == nullptr || std::string(why) == "scale") { ++nScale; }
+                else if (std::string(why) == "warp") { ++nWarp; }
+                else { ++nEdgeClaim; }
                 col.scale = saved;                  // revert; stay skipped (fallback)
                 continue;
             }
@@ -1128,6 +1448,9 @@ int main(int argc, char *argv[])
             ++nRecovered;
         }
         Info<< "SPLITLAYERS|recovered|" << nRecovered << nl;
+        Info<< "SPLITLAYERS|recoverAbort|noCanon|" << nNoCanon
+            << "|warp|" << nWarp << "|scale|" << nScale
+            << "|edgeClaim|" << nEdgeClaim << nl;
     }
 
     // ---- PASS 4: topology -------------------------------------------------
@@ -1137,7 +1460,7 @@ int main(int argc, char *argv[])
     {
         const Column& col = columns[ci];
         if (col.skip) { continue; }
-        const label n = specs[col.si].nLayers;
+        const label n = col.nCol;   // I-INT: gap-capped layer count
         labelList stack(n + 1);
         forAll(stack, j)
         {
@@ -1239,11 +1562,77 @@ int main(int argc, char *argv[])
         return sit.good() ? sit.val() : railsOf[railKey(cl, 0)].assign;
     };
 
+    // OOB instrument (find the UB behind the changeMesh boundary-face crash): the
+    // lateral pass indexes stack[ringsBefore[i]+s] and oStack[oBefore+s]; for a
+    // recovered column whose assign doesn't line up with a neighbour these can run
+    // past the (nLayers+1)-entry stack — an out-of-bounds List read that returns a
+    // garbage neighbour label and crashes changeMesh. Detect + report the
+    // site/column/index, and CLAMP so the run completes (mesh wrong but no UB).
+    label nOOB = 0;
+    auto chk = [&](const label idx, const label sz,
+                   const char* site, const label cc) -> label
+    {
+        if (idx >= 0 && idx < sz) { return idx; }
+        ++nOOB;
+        if (nOOB <= 12)
+        {
+            Info<< "SPLITLAYERS|OOB|" << site << "|ci|" << cc
+                << "|idx|" << idx << "|size|" << sz << nl;
+        }
+        return (idx < 0) ? 0 : sz - 1;
+    };
+    // I-INT layer termination: when THIS column has more layers than a NEIGHBOUR
+    // (variable-n gap caps), its upper layers connect to the neighbour's REMAINDER
+    // (last stack cell). This is by design, so clamp SILENTLY — unlike chk, which
+    // alarms because an over-run of a column's OWN stack would be a real bug.
+    auto term = [&](const label idx, const label sz) -> label
+    {
+        return (idx >= sz) ? sz - 1 : ((idx < 0) ? 0 : idx);
+    };
+
+    // BADFACE instrument: the changeMesh crash is a dangling face that ends as
+    // (owner, neighbour -1, region -1) — a boundary face with no patch. Catch the
+    // exact condition at the source (a face being modified/added with nei<0 AND
+    // patch<0) and report which pass/column/face + the owner-resolution context.
+    label nBad = 0, nDefer = 0;
+    // cellCol holds every REMOVED chain cell (filled in the PASS-4 stack loop
+    // below). A face whose owner/neighbour resolves to a cell still in cellCol
+    // dangles after changeMesh (that cell is gone) — so does (nei<0 && patch<0).
+    auto badFace = [&](const char* pass, const label fi, const label cc,
+                       const label own, const label nei, const label patch,
+                       const label other2, const bool otherSplit2)
+    {
+        const bool danglOwn = (own >= 0 && cellCol.found(own));
+        const bool danglNei = (nei >= 0 && cellCol.found(nei));
+        if ((nei < 0 && patch < 0) || danglOwn || danglNei)
+        {
+            ++nBad;
+            if (nBad <= 16)
+            {
+                Info<< "SPLITLAYERS|BADFACE|" << pass << "|fi|" << fi
+                    << "|ci|" << cc << "|own|" << own << "|nei|" << nei
+                    << "|patch|" << patch << "|other|" << other2
+                    << "|otherSplit|" << otherSplit2
+                    << "|danglOwn|" << danglOwn << "|danglNei|" << danglNei
+                    // task 19: name the columns owning the dangling sides + their
+                    // nCol, to read the variable-n jump across the failing face
+                    // (asymmetric ownN!=neiN => a deeper-neighbour defer not picked
+                    // up; equal => a different lateral-handling gap).
+                    << "|ownCol|" << (danglOwn ? cellCol[own] : -1)
+                    << "|ownN|" << (danglOwn ? columns[cellCol[own]].nCol : -1)
+                    << "|neiCol|" << (danglNei ? cellCol[nei] : -1)
+                    << "|neiN|" << (danglNei ? columns[cellCol[nei]].nCol : -1)
+                    << "|internalFi|" << mesh.isInternalFace(fi)
+                    << "|whichPatch|" << patches.whichPatch(fi) << nl;
+            }
+        }
+    };
+
     forAll(columns, ci)
     {
         const Column& col = columns[ci];
         if (col.skip) { continue; }
-        const label n = specs[col.si].nLayers;
+        const label n = col.nCol;   // I-INT: gap-capped layer count
         const label patchi = patches.findPatchID(specs[col.si].patchName);
         const labelList& stack = stackOf[ci];
         const labelList& assign = assignFor(ci, col);
@@ -1305,7 +1694,7 @@ int main(int argc, char *argv[])
                     if (!columns[oc].skip
                      && columns[oc].chain.last() == celli)
                     {
-                        return stackOf[oc][specs[columns[oc].si].nLayers];
+                        return stackOf[oc][columns[oc].nCol];   // I-INT: remainder
                     }
                 }
                 return celli;
@@ -1316,17 +1705,42 @@ int main(int argc, char *argv[])
             if (mesh.isInternalFace(col.topFace))
             {
                 const label neiO = mesh.faceNeighbour()[col.topFace];
-                meshMod.modifyFace(tfr, col.topFace,
-                    remap(ownO), remap(neiO), false, -1, -1, false);
+                // If a side of this top face is the NON-last chain cell of ANOTHER
+                // splitting column, the face is that column's SIDE face — its
+                // correct stack-cell assignment belongs to that column's side-face
+                // pass (section 5 below), which reassigns BOTH sides via the strip
+                // logic. remap here can only reach the remainder, which is wrong
+                // for an offset opposing-wall gap meeting (open cells) AND leaves
+                // the removed cell dangling (the crash). DEFER: leave it unhandled
+                // so the owning side-face pass picks it up. Head-on last-to-last
+                // is NOT a side-of-other, so it still maps via remap -> remainder.
+                auto sideOfOther = [&](const label c) -> bool
+                {
+                    if (c < 0 || !cellCol.found(c)) { return false; }
+                    const label oc = cellCol[c];
+                    return oc != ci && !columns[oc].skip
+                        && columns[oc].chain.last() != c;
+                };
+                if (sideOfOther(ownO) || sideOfOther(neiO))
+                {
+                    ++nDefer;       // owning column's side-face pass handles it
+                }
+                else
+                {
+                    meshMod.modifyFace(tfr, col.topFace,
+                        remap(ownO), remap(neiO), false, -1, -1, false);
+                    faceDone.set(col.topFace);
+                    recordFace(col.topFace, "top", ci);
+                }
             }
             else
             {
                 meshMod.modifyFace(tfr, col.topFace, stack[n], -1, false,
                                    patches.whichPatch(col.topFace),
                                    -1, false);
+                faceDone.set(col.topFace);
+                recordFace(col.topFace, "top", ci);
             }
-            faceDone.set(col.topFace);
-            recordFace(col.topFace, "top", ci);
         }
 
         // 5. side faces, per chain cell, partitioned by assigned rings
@@ -1374,6 +1788,19 @@ int main(int argc, char *argv[])
                     otherSeg = columns[cellCol[other]].chain.find(other);
                 }
 
+                // I-INT G3 Step 2: variable-n layer termination. If the neighbour
+                // is DEEPER (more layers), it must build this shared face with ITS
+                // full cuts so all its layers get side faces; our shallower side
+                // terminates to our remainder via the `term` clamp when it does.
+                // DEFER — leave it for the deeper column's side-face pass (which
+                // also iterates this face). Equal counts -> first-come, consistent;
+                // shallower-neighbour -> WE build and IT terminates against us.
+                if (otherSplit && columns[cellCol[other]].nCol > col.nCol)
+                {
+                    ++nDefer;
+                    continue;
+                }
+
                 const label nSub = cutK.size() + 1;
                 for (label s = 0; s < nSub; ++s)
                 {
@@ -1414,7 +1841,8 @@ int main(int argc, char *argv[])
 
                     const label stackIdx = ringsBefore[i] + s;
                     label sOwn = ownO, sNei = neiO;
-                    if (sOwn == col.chain[i]) { sOwn = stack[stackIdx]; }
+                    if (sOwn == col.chain[i])
+                    { sOwn = stack[chk(stackIdx, stack.size(), "stack:sOwn", ci)]; }
                     else if (otherSplit && sOwn == other)
                     {
                         const labelList& oStack = stackOf[cellCol[other]];
@@ -1425,9 +1853,10 @@ int main(int argc, char *argv[])
                         {
                             if (oAssign[k] < otherSeg) { ++oBefore; }
                         }
-                        sOwn = oStack[oBefore + s];
+                        sOwn = oStack[term(oBefore + s, oStack.size())];
                     }
-                    if (sNei == col.chain[i]) { sNei = stack[stackIdx]; }
+                    if (sNei == col.chain[i])
+                    { sNei = stack[chk(stackIdx, stack.size(), "stack:sNei", ci)]; }
                     else if (otherSplit && sNei == other)
                     {
                         const labelList& oStack = stackOf[cellCol[other]];
@@ -1438,13 +1867,15 @@ int main(int argc, char *argv[])
                         {
                             if (oAssign[k] < otherSeg) { ++oBefore; }
                         }
-                        sNei = oStack[oBefore + s];
+                        sNei = oStack[term(oBefore + s, oStack.size())];
                     }
                     const label sPatch = mesh.isInternalFace(fi)
                                        ? -1 : patches.whichPatch(fi);
 
                     const face sfr = withForeignRings(sf);
                     saneCheck(sfr, fi, ci, "strip");
+                    badFace("strip", fi, ci, sOwn, sNei, sPatch,
+                            other, otherSplit);
                     if (s == 0)
                     {
                         meshMod.modifyFace(sfr, fi, sOwn, sNei, false,
@@ -1469,6 +1900,7 @@ int main(int argc, char *argv[])
                     else if (claimed[oth] >= 0)
                     {
                         const label oc = claimed[oth];
+                        faceOtherColOf.insert(fi, oc);   // task 19: opposing column
                         t += ":oc" + std::to_string(oc)
                            + (columns[oc].skip ? "SKIP" : "")
                            + ":oseg"
@@ -1498,6 +1930,24 @@ int main(int argc, char *argv[])
         }
     }
 
+    // task 19 never-crash guard: a lateral face between two SPLIT columns can
+    // escape the side-face pass (a transition defer not picked up — ~40 residual
+    // after gapSmooth) and arrive here with a REMOVED chain cell as owner/
+    // neighbour; after changeMesh that is a (owner, nei -1, region -1) boundary
+    // face = the getFaceOrder FATAL. Remap any removed chain cell to its column's
+    // remainder (a valid cell) so the residual face is merely poor (open/skew) and
+    // the quality-retry orchestrator demotes it, instead of crashing the run.
+    // No-op when the owner is an unsplit cell (cellCol miss) => external aero (no
+    // dangling lateral faces, badFaces 0) is byte-identical.
+    auto latRemap = [&](const label celli) -> label
+    {
+        if (celli >= 0 && cellCol.found(celli))
+        {
+            const label oc = cellCol[celli];
+            if (!columns[oc].skip) { return stackOf[oc][columns[oc].nCol]; }
+        }
+        return celli;
+    };
     for (const label fi : lateralFaces)
     {
         const face& f = faces[fi];
@@ -1520,24 +1970,175 @@ int main(int argc, char *argv[])
                 }
             }
         }
-        const label ownO = mesh.faceOwner()[fi];
-        const label neiO =
+        const label rawOwn = mesh.faceOwner()[fi];
+        const label rawNei =
             mesh.isInternalFace(fi) ? mesh.faceNeighbour()[fi] : -1;
+        const label ownO = latRemap(rawOwn);
+        const label neiO = latRemap(rawNei);
+        // task 19: if a side was a REMOVED cell we just remapped (a transition
+        // victim — the residual gap/skip-boundary faces), ATTRIBUTE the face to
+        // that column so the quality-retry orchestrator can DEMOTE it. A lateral
+        // face is otherwise column -1 = un-demotable, which left the manifold
+        // "stuck" (split-owned failures -> 0, but these lateral ones persisted).
+        // Untouched lateral faces (unsplit owners) stay column -1, unchanged.
+        // recordFace only writes the debug map — the mesh is identical either way.
+        label latCol = -1;
+        if (rawOwn >= 0 && cellCol.found(rawOwn)) { latCol = cellCol[rawOwn]; }
+        else if (rawNei >= 0 && cellCol.found(rawNei)) { latCol = cellCol[rawNei]; }
         const face nfF{labelList(nf)};
         saneCheck(nfF, fi, -1, "lateral");
+        const label latPatch =
+            mesh.isInternalFace(fi) ? -1 : patches.whichPatch(fi);
+        badFace("lateral", fi, latCol, ownO, neiO, latPatch, -1, false);
         meshMod.modifyFace
         (
-            nfF, fi, ownO, neiO, false,
-            mesh.isInternalFace(fi) ? -1 : patches.whichPatch(fi),
-            -1, false
+            nfF, fi, ownO, neiO, false, latPatch, -1, false
         );
         faceDone.set(fi);
-        recordFace(fi, "lateral", -1);
+        recordFace(fi, latCol >= 0 ? "lateralRemap" : "lateral", latCol);
+    }
+
+    // post-pass: any ORIGINAL face of a removed chain cell that no pass handled
+    // (not in faceDone) dangles — it keeps its removed-cell owner and, if its
+    // other side is also removed, ends as (owner, neighbour -1, region -1): the
+    // changeMesh boundary-face crash. This catches the untouched-face case the
+    // per-site badFace check cannot see.
+    label nUnhandled = 0;
+    forAllConstIters(cellCol, itc)
+    {
+        for (const label fi : mesh.cells()[itc.key()])
+        {
+            if (!faceDone.test(fi))
+            {
+                ++nUnhandled;
+                if (nUnhandled <= 16)
+                {
+                    Info<< "SPLITLAYERS|UNHANDLED|fi|" << fi
+                        << "|cell|" << itc.key() << "|ci|" << itc.val()
+                        << "|internalFi|" << mesh.isInternalFace(fi)
+                        << "|whichPatch|" << patches.whichPatch(fi) << nl;
+                }
+            }
+        }
     }
 
     // ---- apply ------------------------------------------------------------
+    Info<< "SPLITLAYERS|OOBtotal|" << nOOB << "|badFaces|" << nBad
+        << "|deferredTop|" << nDefer << "|unhandled|" << nUnhandled << nl;
     autoPtr<mapPolyMesh> map = meshMod.changeMesh(mesh, false);
     mesh.updateMesh(map());
+
+    // I-INT pinpoint: open cells (face-area-vectors don't sum to ~0) are the
+    // variable-n termination defect. Attribute each to the constructs that built
+    // its faces (final->origin faceMap + recordFace tags) + the owning column and
+    // its nCol — so we see the deep/shallow boundary that fails to close.
+    {
+        const labelList& fMap = map().faceMap();
+        const vectorField& fa = mesh.faceAreas();
+        const labelList& fo = mesh.faceOwner();
+        label nOpenCell = 0;
+        // task 19: dump a column's seg0 ring-point coordinates (from newPtPos,
+        // which changeMesh does not move; nOptSweeps == 0) per rail, with each
+        // rail's wall base point. Guards skip / missing railKey / missing point
+        // so the diagnostic can never throw.
+        auto dumpSeg0 = [&](const label X, const char* side)
+        {
+            if (X < 0 || X >= columns.size() || columns[X].skip) { return; }
+            const Column& cx = columns[X];
+            const bool sharer = sharerRings.found(X);
+            if (!sharer && !railsOf.found(railKey(cx, 0))) { return; }
+            const labelList& asg = assignFor(X, cx);
+            forAll(cx.rails, rc)
+            {
+                if (!sharer && !railsOf.found(railKey(cx, rc))) { continue; }
+                const labelList& rg = ringsFor(X, cx, rc);
+                const point& wp = pts[cx.rails[rc][0]];
+                Info<< "SPLITLAYERS|OPPWALL|" << side << "|" << X
+                    << "|rail|" << rc
+                    << "|wall|(" << wp.x() << ' ' << wp.y() << ' '
+                    << wp.z() << ")|seg0";
+                forAll(asg, k)
+                {
+                    if (asg[k] != 0 || k >= rg.size()) { continue; }
+                    const auto pit = newPtPos.cfind(rg[k]);
+                    if (pit.good())
+                    {
+                        const point& rp = pit.val();
+                        Info<< "|" << k << ":(" << rp.x() << ' '
+                            << rp.y() << ' ' << rp.z() << ')';
+                    }
+                }
+                Info<< nl;
+            }
+        };
+        forAll(mesh.cells(), celli)
+        {
+            const cell& c = mesh.cells()[celli];
+            vector s = Zero;
+            scalar amax = VSMALL;
+            for (const label fi : c)
+            {
+                s += (fo[fi] == celli ? 1.0 : -1.0) * fa[fi];
+                amax = max(amax, mag(fa[fi]));
+            }
+            if (mag(s) > 1e-6 * amax)
+            {
+                ++nOpenCell;
+                if (nOpenCell <= 16)
+                {
+                    word tags; label col = -1;
+                    for (const label fi : c)
+                    {
+                        const label of = (fi < fMap.size()) ? fMap[fi] : -1;
+                        if (of >= 0 && faceTagOf.found(of))
+                        {
+                            tags = tags + faceTagOf[of] + "|";
+                            if (col < 0 && faceColOf.found(of))
+                            {
+                                col = faceColOf[of];
+                            }
+                        }
+                    }
+                    Info<< "SPLITLAYERS|OPENCELL|openness|" << mag(s)/amax
+                        << "|col|" << col
+                        << "|nCol|" << (col >= 0 ? columns[col].nCol : -1)
+                        << "|tags|" << tags << nl;
+
+                    // task 19: for an opposed open cell, dump the GEOMETRY of the
+                    // two facing-wall columns' seg0 ring points so the collision is
+                    // diagnosed from coordinates, not guessed. Find a strip face in
+                    // this cell that names an opposing column (faceOtherColOf).
+                    if (debugDump)
+                    {
+                        label colA = -1, colB = -1;
+                        for (const label fi : c)
+                        {
+                            const label of = (fi < fMap.size()) ? fMap[fi] : -1;
+                            if (of >= 0 && faceOtherColOf.found(of)
+                             && faceColOf.found(of))
+                            {
+                                colA = faceColOf[of];
+                                colB = faceOtherColOf[of];
+                                break;
+                            }
+                        }
+                        if (colA >= 0 && colB >= 0)
+                        {
+                            Info<< "SPLITLAYERS|OPPWALL|cell|" << celli
+                                << "|openness|" << mag(s)/amax
+                                << "|colA|" << colA
+                                << "|nA|" << columns[colA].nCol
+                                << "|colB|" << colB
+                                << "|nB|" << columns[colB].nCol << nl;
+                            dumpSeg0(colA, "A");
+                            dumpSeg0(colB, "B");
+                        }
+                    }
+                }
+            }
+        }
+        Info<< "SPLITLAYERS|openCells|" << nOpenCell << nl;
+    }
 
     if (debugDump)
     {
