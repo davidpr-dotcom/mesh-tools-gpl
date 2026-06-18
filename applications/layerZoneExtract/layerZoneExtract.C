@@ -86,9 +86,13 @@ int main(int argc, char *argv[])
     }
     zones.clearAddressing();
 
-    // Persist constant/polyMesh/cellZones (mesh.write writes the whole mesh; the
-    // points/faces are unchanged — same pattern refineUnrefineCycle uses).
-    const bool ok = mesh.write();
+    // Persist constant/polyMesh/cellZones. CRITICAL: a programmatically-added
+    // cellZone is NOT written by mesh.write() unless the cellZoneMesh is marked
+    // AUTO_WRITE — its default writeOpt is NO_WRITE when the mesh was read WITHOUT
+    // zones, so mesh.write() silently skips it (the bug that made the zone never
+    // reach disk while rc stayed 0). Set AUTO_WRITE, then write the zones directly.
+    mesh.cellZones().writeOpt(IOobject::AUTO_WRITE);
+    const bool ok = mesh.cellZones().write();
     Info<< "LZE|zone|" << zoneName << "|id|" << zid
         << "|cells|" << cellLabels.size() << "|written|" << ok << nl;
 

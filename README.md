@@ -21,6 +21,7 @@ communicates with these tools **only via files across a process boundary**
 |------|--------|---------|
 | `splitLayers` | working prototype (WP 5.4-spike) | Split wall-adjacent hex cells into geometrically graded boundary layers: ring-point insertion along columns, smoothed-normal or edge placement (`-placement`), offset-vector smoothing optimizer (`-optimizeSweeps`). Verified by the cavity smoke test in all ablation modes |
 | `layerZoneExtract` | working (Stage A, 2026-06-18) | Emit protected cellZones (+ dynamicMeshDict fragment) for AMR from layer-cell reports — protects AMR-destructible extrusion layers (WP 5.3) |
+| `layerAmrSurvival` | working (Stage A, 2026-06-18) | A/B AMR-survival test for boundary layers: refine+unrefine a sampled set, `-protect` freezes the layer cellZone from unrefinement (protectedCell_); decides AMR-native vs needs-protection (I4.2 guard) |
 | `refinementFieldWriter` | planned (WP 7.2) | Error-indicator fields for dynamicRefineFvMesh |
 
 ## Building
