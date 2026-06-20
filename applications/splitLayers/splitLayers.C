@@ -194,7 +194,8 @@ int main(int argc, char *argv[])
     argList::addOption("placement", "edge|normal",
                        "single-cell-column placement (default: normal)");
     argList::addOption("optimizeSweeps", "N",
-                       "tangential smoothing sweeps (default 10, 0=off)");
+                       "quality-gated layer optimize sweeps — accept a smoothing move "
+                       "only if neither local nonOrtho nor skew rises (default 10, 0=off)");
     argList::addOption("featureAngle", "deg",
                        "feature-point detection angle (default 45)");
     argList::addOption("convexRidgeAngle", "deg",
@@ -2229,6 +2230,78 @@ int main(int argc, char *argv[])
         }
         const Vector<label>& geomD = mesh.geometricD();
 
+        // I3.1 quality-objective gate (accept-only-if-better). The smoothing
+        // CANDIDATE is unchanged; each move is taken only if NEITHER the local max
+        // nonOrtho NOR the local max skew rises. faceQ recomputes a face's nonOrtho
+        // + skewness from a trial points field using checkMesh's own definitions
+        // (cell volume-centroids via cell::centre, face geom via areaNormal/centre).
+        // Per-point local-max non-increasing => global max non-increasing for BOTH
+        // metrics (never-worse) — the property the old blind smoother lacked
+        // (it regressed bracket 43.9->78.9, why sweeps shipped 0).
+        const faceList& mFaces = mesh.faces();
+        const cellList& mCells = mesh.cells();
+        const labelList& fOwn = mesh.faceOwner();
+        const labelList& fNei = mesh.faceNeighbour();
+        const label nInt = mesh.nInternalFaces();
+
+        auto faceQ = [&](const label fi, const pointField& P) -> Pair<scalar>
+        {
+            const point Co = mCells[fOwn[fi]].centre(P, mFaces);
+            const point Cn = mCells[fNei[fi]].centre(P, mFaces);
+            const vector Sf = mFaces[fi].areaNormal(P);
+            const point Cf = mFaces[fi].centre(P);
+            const vector d = Cn - Co;
+            const scalar magd = mag(d), magS = mag(Sf);
+            scalar no = 0, sk = 0;
+            if (magd > SMALL && magS > SMALL)
+            {
+                no = radToDeg(Foam::acos(min(scalar(1), mag((d & Sf)/(magd*magS)))));
+                const scalar den = (d & Sf);
+                if (mag(den) > SMALL)
+                {
+                    const point Ci = Co + (((Cf - Co) & Sf)/den) * d;
+                    sk = mag(Cf - Ci) / magd;
+                }
+            }
+            return Pair<scalar>(no, sk);
+        };
+        // The affected set when np moves = ALL faces of the cells incident to np:
+        // moving np shifts those cells' volume-centroids, which changes the nonOrtho
+        // of EVERY one of their faces (owner−neighbour vector), not only the faces
+        // that touch np. Gating on pointFaces alone missed the cells' opposite faces
+        // and let the global max rise — so evaluate over pointCells' faces.
+        auto localJ = [&](const label np, const pointField& P) -> Pair<scalar>
+        {
+            scalar wno = 0, wsk = 0;
+            for (const label ci : mesh.pointCells()[np])
+            {
+                for (const label fi : mCells[ci])
+                {
+                    if (fi >= nInt) { continue; }
+                    const Pair<scalar> q = faceQ(fi, P);
+                    wno = max(wno, q.first()); wsk = max(wsk, q.second());
+                }
+            }
+            return Pair<scalar>(wno, wsk);
+        };
+        auto maxLayerNonOrtho = [&]() -> scalar
+        {
+            scalar m = 0;
+            forAll(inserted, i)
+            {
+                for (const label ci : mesh.pointCells()[inserted[i]])
+                {
+                    for (const label fi : mCells[ci])
+                    {
+                        if (fi < nInt) { m = max(m, faceQ(fi, newPts).first()); }
+                    }
+                }
+            }
+            return m;
+        };
+
+        const scalar noBefore = maxLayerNonOrtho();
+        label nMoved = 0;
         for (label sweep = 0; sweep < nOptSweeps; ++sweep)
         {
             vectorField acc(newPts.size(), Zero);
@@ -2249,23 +2322,108 @@ int main(int argc, char *argv[])
             {
                 const label np = inserted[i];
                 if (cnt[np] < 1) { continue; }
-                const point& bp = newPts[baseNewOf[np]];
-                const vector vOwn = newPts[np] - bp;
-                vector v = 0.5 * vOwn + 0.5 * acc[np] / cnt[np];
-                const scalar mv = mag(v);
-                if (mv > SMALL) { v *= mag(vOwn) / mv; }
-                else { v = vOwn; }
-                point target = bp + v;
-                for (direction cmpt = 0; cmpt < 3; ++cmpt)
+                const point bp = newPts[baseNewOf[np]];
+                const point oldPos = newPts[np];
+                const vector vOwn = oldPos - bp;
+                const scalar L = mag(vOwn);
+                if (L < SMALL) { continue; }
+
+                // Local descent on the quality objective: try a small set of offset
+                // DIRECTIONS — the Laplacian smooth + axis-tilt probes — each
+                // renormalized to |vOwn| so the layer height (y+) is preserved, plus
+                // "no move". Pick the candidate with the lowest nonOrtho that worsens
+                // NEITHER nonOrtho nor skew vs the current position (so every move is
+                // an improvement or a hold = never-worse). This actively reduces the
+                // worst face instead of gating one fixed Laplacian candidate.
+                const Pair<scalar> J0 = localJ(np, newPts);
+                DynamicList<vector> dirs(8);
+                dirs.append(vOwn);                                  // no move (never-worse floor)
+                dirs.append(0.5 * vOwn + 0.5 * acc[np] / cnt[np]);  // Laplacian smooth
+                const scalar dStep = 0.2 * L;
+                for (direction a = 0; a < 3; ++a)
                 {
-                    if (geomD[cmpt] < 0) { target[cmpt] = newPts[np][cmpt]; }
+                    if (geomD[a] < 0) { continue; }
+                    vector e(Zero); e[a] = dStep;
+                    dirs.append(vOwn + e);
+                    dirs.append(vOwn - e);
                 }
-                newPts[np] = target;
+                point best = oldPos;
+                Pair<scalar> bestJ = J0;
+                for (const vector& vd : dirs)
+                {
+                    const scalar m = mag(vd);
+                    if (m < SMALL) { continue; }
+                    point cand = bp + vd * (L / m);                 // renormalize -> height kept
+                    for (direction a = 0; a < 3; ++a)
+                    {
+                        if (geomD[a] < 0) { cand[a] = oldPos[a]; }  // freeze out-of-plane
+                    }
+                    newPts[np] = cand;
+                    const Pair<scalar> Jc = localJ(np, newPts);
+                    if (Jc.first()  <= J0.first()  + 1e-9           // never-worse: nonOrtho
+                     && Jc.second() <= J0.second() + 1e-9           // never-worse: skew
+                     && Jc.first()  <  bestJ.first() - 1e-12)       // strictly better nonOrtho
+                    {
+                        best = cand; bestJ = Jc;
+                    }
+                }
+                newPts[np] = best;
+                if (mag(best - oldPos) > SMALL) { ++nMoved; }
             }
         }
+        const scalar noAfter = maxLayerNonOrtho();
+
+        // WORSTFACE locator (behaviour-neutral): the highest-nonOrtho layer faces,
+        // each with its construct tag (built->orig faceMap + faceTagOf, populated
+        // under -debugDump) + centre — to confirm whether the standing max sits at
+        // sharp EDGES (ridge/strip constructs) before any edge-aware construction
+        // (v3). At sweeps>0 these are the faces the descent could NOT reduce.
+        {
+            const labelList& fMap = map().faceMap();
+            DynamicList<scalar> noList;
+            DynamicList<label> fidList;
+            labelHashSet seen;
+            forAll(inserted, i)
+            {
+                for (const label ci : mesh.pointCells()[inserted[i]])
+                {
+                    for (const label fi : mCells[ci])
+                    {
+                        if (fi < nInt && seen.insert(fi))
+                        {
+                            noList.append(faceQ(fi, newPts).first());
+                            fidList.append(fi);
+                        }
+                    }
+                }
+            }
+            labelList order;
+            sortedOrder(noList, order);                       // ascending
+            const label n = order.size();
+            const label nShow = min(label(20), n);
+            for (label k = 0; k < nShow; ++k)
+            {
+                const label idx = order[n - 1 - k];           // worst first
+                const label fi = fidList[idx];
+                const point Cf = mesh.faces()[fi].centre(newPts);
+                word tag("none"); label col = -1;
+                const label of = (fi < fMap.size() ? fMap[fi] : -1);
+                if (of >= 0 && faceTagOf.found(of))
+                {
+                    tag = faceTagOf[of];
+                    if (faceColOf.found(of)) { col = faceColOf[of]; }
+                }
+                Info<< "SPLITLAYERS|WORSTFACE|rank|" << k
+                    << "|nonOrtho|" << noList[idx]
+                    << "|centre|(" << Cf.x() << ' ' << Cf.y() << ' ' << Cf.z() << ")"
+                    << "|tag|" << tag << "|col|" << col << nl;
+            }
+        }
+
         mesh.movePoints(newPts);
         Info<< "SPLITLAYERS|optimize|sweeps|" << nOptSweeps
-            << "|points|" << inserted.size() << nl;
+            << "|points|" << inserted.size() << "|moved|" << nMoved
+            << "|nonOrthoBefore|" << noBefore << "|nonOrthoAfter|" << noAfter << nl;
     }
 
     mesh.setInstance(runTime.constant());
