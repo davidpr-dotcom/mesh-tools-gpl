@@ -2255,7 +2255,11 @@ int main(int argc, char *argv[])
             scalar no = 0, sk = 0;
             if (magd > SMALL && magS > SMALL)
             {
-                no = radToDeg(Foam::acos(min(scalar(1), mag((d & Sf)/(magd*magS)))));
+                // SIGNED (0..180) = checkMesh's true angle. An earlier mag() folded
+                // 90..180 to 90..0, which would let the never-worse gate REWARD
+                // inversion. Harmless here (split moves stay <90) but fixed for
+                // robustness — it detonated the layerOptimize port (2026-06-21).
+                no = radToDeg(Foam::acos(max(scalar(-1), min(scalar(1), (d & Sf)/(magd*magS)))));
                 const scalar den = (d & Sf);
                 if (mag(den) > SMALL)
                 {
