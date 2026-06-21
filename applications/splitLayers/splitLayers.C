@@ -2461,8 +2461,10 @@ int main(int argc, char *argv[])
         // layer k=0, so y+ is preserved by construction. Keep the g that lowers the
         // column's nonOrtho without raising its skew (never-worse). colQ scans
         // pointCells of every column point, so all faces the move touches are
-        // gated => global max non-increasing, exactly like localDescent. v1 only
-        // COMPRESSES (g<=1, outer layers stay within [d0, dk]) so it cannot tangle.
+        // gated => global max non-increasing, exactly like localDescent. g spans
+        // compress + MILD expand (<=1.3x): never-worse rejects any g that tangles a
+        // cell (an inverted cell raises nonOrtho/skew, so it is never selected), and
+        // the small expansion bound keeps outer layers well clear of the next column.
         auto cornerScale = [&](const label nSweeps) -> label
         {
             Map<DynamicList<label>> colMap;
@@ -2498,7 +2500,7 @@ int main(int argc, char *argv[])
                 }
                 return Pair<scalar>(no, sk);
             };
-            const scalar gCand[] = {0.6, 0.75, 0.9};   // compress-only (safe)
+            const scalar gCand[] = {0.6, 0.75, 0.9, 1.15, 1.3};  // compress + mild expand
             label nMoved = 0;
             scalar prevMax = VGREAT;
             for (label sweep = 0; sweep < nSweeps; ++sweep)
