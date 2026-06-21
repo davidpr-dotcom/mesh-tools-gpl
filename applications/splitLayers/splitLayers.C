@@ -2301,8 +2301,29 @@ int main(int argc, char *argv[])
         };
 
         const scalar noBefore = maxLayerNonOrtho();
+
+        // === optimizer: localDescent (the I3.1 v2 quality-objective descent) ======
+        // Registered behind the dispatch interface as the GENERAL optimizer (it
+        // always applies). Every optimizer is never-worse, so the dispatcher can
+        // compose them; Phase 2 adds cornerScale, selected when the census flags a
+        // localized wall+rings corner cluster (see docs/2026-06-20-optimize-phase-
+        // dispatch.md).
+        // Active-set thresholds (used by localDescent): descend only points
+        // incident to a face with nonOrtho >= T = max(FLOOR, FRAC*currentMax).
+        // Points touching only lower faces cannot reduce the global max (they
+        // are not vertices of any >=T face's cells), so skipping them is a pure
+        // speedup with no loss on the max objective. T tracks the current max so
+        // the set stays tight + shrinks as the descent progresses.
+        const scalar OPT_ACTIVE_FRAC  = 0.7;
+        const scalar OPT_ACTIVE_FLOOR = 30.0;
+        const scalar OPT_CONV_TOL     = 1e-4;   // stop when the max nonOrtho's
+                                                // relative improvement < this
+        const label  OPT_MAX_ROUNDS   = 4;      // dispatcher: max optimizer rounds
+        auto localDescent = [&](const label nSweeps) -> label
+        {
         label nMoved = 0;
-        for (label sweep = 0; sweep < nOptSweeps; ++sweep)
+        scalar prevMax = VGREAT;
+        for (label sweep = 0; sweep < nSweeps; ++sweep)
         {
             vectorField acc(newPts.size(), Zero);
             scalarField cnt(newPts.size(), 0.0);
@@ -2318,9 +2339,67 @@ int main(int argc, char *argv[])
                     }
                 }
             }
+
+            // ---- active set: inserted points that can affect a >=T face ----
+            // One scan of the layer faces -> current max -> T -> mark the
+            // inserted vertices of every >=T face's two cells. Cheap vs the
+            // descent (O(layer faces) once, not O(points*candidates*faces)).
+            boolList activePt(newPts.size(), false);
+            scalar curMax = 0;
+            {
+                DynamicList<label> lf;       // deduped layer faces
+                DynamicList<scalar> lno;     // their nonOrtho
+                labelHashSet seenA;
+                forAll(inserted, i)
+                {
+                    for (const label ci : mesh.pointCells()[inserted[i]])
+                    {
+                        for (const label fi : mCells[ci])
+                        {
+                            if (fi < nInt && seenA.insert(fi))
+                            {
+                                const scalar no = faceQ(fi, newPts).first();
+                                lf.append(fi); lno.append(no);
+                                curMax = max(curMax, no);
+                            }
+                        }
+                    }
+                }
+                const scalar T = max(OPT_ACTIVE_FLOOR, OPT_ACTIVE_FRAC*curMax);
+                forAll(lf, j)
+                {
+                    if (lno[j] >= T)
+                    {
+                        const label fi = lf[j];
+                        for (const label vp : mCells[fOwn[fi]].labels(mFaces))
+                        { activePt[vp] = true; }
+                        for (const label vp : mCells[fNei[fi]].labels(mFaces))
+                        { activePt[vp] = true; }
+                    }
+                }
+                label nAct = 0;
+                forAll(activePt, p) { if (activePt[p]) { ++nAct; } }
+                Info<< "SPLITLAYERS|active|sweep|" << sweep
+                    << "|curMax|" << curMax << "|T|" << T
+                    << "|activePts|" << nAct << "|layerFaces|" << lf.size() << nl;
+            }
+
+            // early stop: the max nonOrtho stopped improving (relative tol).
+            // Safe because the descent is monotone (never-worse) -> curMax is
+            // non-increasing; once it plateaus, further sweeps are no-ops.
+            if (sweep > 0
+             && (prevMax - curMax) < OPT_CONV_TOL*max(prevMax, scalar(SMALL)))
+            {
+                Info<< "SPLITLAYERS|converged|sweep|" << sweep
+                    << "|curMax|" << curMax << nl;
+                break;
+            }
+            prevMax = curMax;
+
             forAll(inserted, i)
             {
                 const label np = inserted[i];
+                if (!activePt[np]) { continue; }
                 if (cnt[np] < 1) { continue; }
                 const point bp = newPts[baseNewOf[np]];
                 const point oldPos = newPts[np];
@@ -2371,6 +2450,138 @@ int main(int argc, char *argv[])
                 if (mag(best - oldPos) > SMALL) { ++nMoved; }
             }
         }
+        return nMoved;
+        };  // === end optimizer: localDescent ===
+
+        // === optimizer: cornerScale (radial scale lever) ========================
+        // localDescent only changes the offset DIRECTION (it renormalizes to keep
+        // the layer height), so it cannot fix a defect that needs a thickness
+        // change. cornerScale adds the missing DOF: per hot column (max face >=T),
+        // re-space the OUTER layers (k>=1) by one factor g while PINNING the first
+        // layer k=0, so y+ is preserved by construction. Keep the g that lowers the
+        // column's nonOrtho without raising its skew (never-worse). colQ scans
+        // pointCells of every column point, so all faces the move touches are
+        // gated => global max non-increasing, exactly like localDescent. v1 only
+        // COMPRESSES (g<=1, outer layers stay within [d0, dk]) so it cannot tangle.
+        auto cornerScale = [&](const label nSweeps) -> label
+        {
+            Map<DynamicList<label>> colMap;
+            forAll(inserted, i)
+            { colMap(baseNewOf[inserted[i]]).append(inserted[i]); }
+            DynamicList<labelList> cols;
+            forAllConstIters(colMap, it)
+            {
+                labelList c(it.val());
+                std::sort
+                (
+                    c.begin(), c.end(),
+                    [&](label x, label y){ return layerOf[x] < layerOf[y]; }
+                );
+                if (c.size() >= 2) { cols.append(c); }
+            }
+            auto colQ = [&](const labelList& cp) -> Pair<scalar>
+            {
+                scalar no = 0, sk = 0;
+                for (const label np : cp)
+                {
+                    for (const label ci : mesh.pointCells()[np])
+                    {
+                        for (const label fi : mCells[ci])
+                        {
+                            if (fi < nInt)
+                            {
+                                const Pair<scalar> q = faceQ(fi, newPts);
+                                no = max(no, q.first()); sk = max(sk, q.second());
+                            }
+                        }
+                    }
+                }
+                return Pair<scalar>(no, sk);
+            };
+            const scalar gCand[] = {0.6, 0.75, 0.9};   // compress-only (safe)
+            label nMoved = 0;
+            scalar prevMax = VGREAT;
+            for (label sweep = 0; sweep < nSweeps; ++sweep)
+            {
+                const scalar curMax = maxLayerNonOrtho();
+                if (sweep > 0
+                 && (prevMax - curMax) < OPT_CONV_TOL*max(prevMax, scalar(SMALL)))
+                {
+                    break;
+                }
+                prevMax = curMax;
+                const scalar T = max(OPT_ACTIVE_FLOOR, OPT_ACTIVE_FRAC*curMax);
+                label nHot = 0;
+                forAll(cols, c)
+                {
+                    const labelList& cp = cols[c];
+                    const point bp = newPts[baseNewOf[cp[0]]];
+                    const scalar d0 = mag(newPts[cp[0]] - bp);
+                    if (d0 < SMALL) { continue; }
+                    const Pair<scalar> J0 = colQ(cp);
+                    if (J0.first() < T) { continue; }   // active: hot columns only
+                    ++nHot;
+                    List<point> orig(cp.size());
+                    forAll(cp, k) { orig[k] = newPts[cp[k]]; }
+                    scalar bestG = 1.0; Pair<scalar> bestJ = J0;
+                    for (const scalar g : gCand)
+                    {
+                        for (label k = 1; k < cp.size(); ++k)
+                        {
+                            const vector off = orig[k] - bp;
+                            const scalar dk = mag(off);
+                            if (dk < SMALL) { continue; }
+                            newPts[cp[k]] = bp + (off/dk)*(d0 + g*(dk - d0));
+                        }
+                        const Pair<scalar> Jg = colQ(cp);
+                        if (Jg.first()  <= J0.first()  + 1e-9
+                         && Jg.second() <= J0.second() + 1e-9
+                         && Jg.first()  <  bestJ.first() - 1e-12)
+                        {
+                            bestG = g; bestJ = Jg;
+                        }
+                        forAll(cp, k) { newPts[cp[k]] = orig[k]; }   // restore
+                    }
+                    if (bestG != 1.0)
+                    {
+                        for (label k = 1; k < cp.size(); ++k)
+                        {
+                            const vector off = orig[k] - bp;
+                            const scalar dk = mag(off);
+                            if (dk < SMALL) { continue; }
+                            newPts[cp[k]] = bp + (off/dk)*(d0 + bestG*(dk - d0));
+                        }
+                        ++nMoved;
+                    }
+                }
+                Info<< "SPLITLAYERS|cornerScale|sweep|" << sweep
+                    << "|curMax|" << curMax << "|T|" << T
+                    << "|hotCols|" << nHot << "|moved|" << nMoved << nl;
+            }
+            return nMoved;
+        };  // === end optimizer: cornerScale ===
+
+        // === dispatcher: stall-driven multi-optimizer pipeline ==================
+        // Run each optimizer (each never-worse, each self-targeting the residual
+        // >=T faces) to its own stall, then re-run the pipeline; stop when a full
+        // round makes no global progress. Composing different levers — localDescent
+        // (direction) + cornerScale (radial scale) — lets one pick up where the
+        // other stalls (the "combine when one stalls" idea). Monotone + safe
+        // because every optimizer only holds-or-improves the global max.
+        label nMoved = 0;
+        for (label round = 0; round < OPT_MAX_ROUNDS; ++round)
+        {
+            const scalar rBefore = maxLayerNonOrtho();
+            nMoved += localDescent(nOptSweeps);
+            nMoved += cornerScale(nOptSweeps);
+            const scalar rAfter = maxLayerNonOrtho();
+            Info<< "SPLITLAYERS|dispatch|round|" << round
+                << "|before|" << rBefore << "|after|" << rAfter << nl;
+            if (rBefore - rAfter < OPT_CONV_TOL*max(rBefore, scalar(SMALL)))
+            {
+                break;
+            }
+        }
         const scalar noAfter = maxLayerNonOrtho();
 
         // WORSTFACE locator (behaviour-neutral): the highest-nonOrtho layer faces,
@@ -2401,6 +2612,8 @@ int main(int argc, char *argv[])
             sortedOrder(noList, order);                       // ascending
             const label n = order.size();
             const label nShow = min(label(20), n);
+            word worstTag("none");
+            labelHashSet worstCols;
             for (label k = 0; k < nShow; ++k)
             {
                 const label idx = order[n - 1 - k];           // worst first
@@ -2413,11 +2626,24 @@ int main(int argc, char *argv[])
                     tag = faceTagOf[of];
                     if (faceColOf.found(of)) { col = faceColOf[of]; }
                 }
+                if (k == 0) { worstTag = tag; }
+                if (col >= 0) { worstCols.insert(col); }
                 Info<< "SPLITLAYERS|WORSTFACE|rank|" << k
                     << "|nonOrtho|" << noList[idx]
                     << "|centre|(" << Cf.x() << ' ' << Cf.y() << ' ' << Cf.z() << ")"
                     << "|tag|" << tag << "|col|" << col << nl;
             }
+            // structured CENSUS = the optimize-phase DISPATCH INPUT (mirrors the
+            // split-vs-extrusion dry-run probe): the limiting nonOrtho, the worst
+            // face's construct, and whether the worst faces are a localized column
+            // cluster (cornerScale's signal) or distributed (localDescent's).
+            const bool clustered =
+                (worstCols.size() > 0 && worstCols.size() <= max(label(1), nShow/4));
+            Info<< "SPLITLAYERS|census|maxNonOrtho|"
+                << (n > 0 ? noList[order[n-1]] : scalar(0))
+                << "|worstTag|" << worstTag
+                << "|clustered|" << (clustered ? 1 : 0)
+                << "|nWorstCols|" << worstCols.size() << nl;
         }
 
         mesh.movePoints(newPts);
